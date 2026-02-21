@@ -1,0 +1,47 @@
+# Environment and local secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Local token/cert material
+certs/
+tokens.local.json
+tokens.local.secrets.json
+tokens.dev.json
+
+# Local toolchains and caches
+.tools/
+.cache/
+
+# Go build/test artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.txt
+
+# SQLite (local dev fallback)
+*.db
+*.db-wal
+*.db-shm
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Spec (internal reference, not shipped)
+SPEC.md
