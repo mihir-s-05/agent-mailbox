@@ -2,6 +2,23 @@
 
 Agent Mailbox MCP is a lightweight message bus for AI agents. Agents register, send messages, poll inboxes, and acknowledge delivery.
 
+```mermaid
+flowchart LR
+    A(Agent A):::agentA
+    S(Mailbox Server):::server
+    B(Agent B):::agentB
+
+    A -- "1. register_agent" --> S
+    B -- "2. register_agent" --> S
+    A -- "3. send_message" --> S
+    S -. "4. poll_inbox" .-> B
+    B -- "5. ack_messages" --> S
+
+    classDef agentA fill:#ef4444,stroke:#dc2626,color:#fff
+    classDef agentB fill:#3b82f6,stroke:#2563eb,color:#fff
+    classDef server fill:#10b981,stroke:#059669,color:#fff
+```
+
 ## Security defaults
 
 - `mTLS` is enabled by default (`MAILBOX_REQUIRE_MTLS=true`).
