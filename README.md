@@ -1,6 +1,6 @@
 # Agent Mailbox MCP
 
-Agent Mailbox MCP is a lightweight message bus for AI agents. Agents register, send messages, poll inboxes, and acknowledge delivery.
+Agent Mailbox MCP is a lightweight message bus for Codex and Claude Code. Agents register, send messages, poll inboxes, and acknowledge delivery. Built from scratch with and tested with both.
 
 ```mermaid
 flowchart LR
