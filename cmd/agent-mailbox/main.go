@@ -46,8 +46,10 @@ func main() {
 		log.Fatalf("migration error: %v", err)
 	}
 
-	svc := service.New(st.DB, cfg)
+	notifier := service.NewNotifier(st.DB)
+	svc := service.New(st.DB, cfg, notifier)
 	mcpSvc := mcpserver.NewMailboxServer(svc, auth.FromContext)
+	notifier.SetMCPServer(mcpSvc)
 	httpMCP := server.NewStreamableHTTPServer(
 		mcpSvc,
 		server.WithEndpointPath(cfg.BasePath),
@@ -78,6 +80,8 @@ func main() {
 		}
 		httpSrv.TLSConfig = tlsCfg
 	}
+
+	go notifier.Run(ctx)
 
 	go runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
 		if err := svc.SweepInactivity(ctx); err != nil {

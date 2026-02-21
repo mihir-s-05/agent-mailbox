@@ -38,7 +38,8 @@ func main() {
 		log.Fatalf("migration error: %v", err)
 	}
 
-	svc := service.New(st.DB, cfg)
+	notifier := service.NewNotifier(st.DB)
+	svc := service.New(st.DB, cfg, notifier)
 	reg := auth.NewRegistry(cfg)
 	reg.Start(ctx)
 
@@ -47,6 +48,9 @@ func main() {
 		return reg.LookupToken(token)
 	}
 	mcpSvc := mcpserver.NewMailboxServer(svc, resolver)
+	notifier.SetMCPServer(mcpSvc)
+
+	go notifier.Run(ctx)
 
 	go runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
 		if err := svc.SweepInactivity(ctx); err != nil {
