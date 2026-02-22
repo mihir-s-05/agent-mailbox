@@ -21,8 +21,9 @@ import (
 )
 
 type Service struct {
-	db  *pgxpool.Pool
-	cfg config.Config
+	db       *pgxpool.Pool
+	cfg      config.Config
+	notifier *Notifier
 
 	rlMu       sync.Mutex
 	rateWindow map[string]rateState
@@ -116,10 +117,11 @@ type recipient struct {
 	AgentID string
 }
 
-func New(db *pgxpool.Pool, cfg config.Config) *Service {
+func New(db *pgxpool.Pool, cfg config.Config, notifier *Notifier) *Service {
 	return &Service{
 		db:         db,
 		cfg:        cfg,
+		notifier:   notifier,
 		rateWindow: map[string]rateState{},
 	}
 }
@@ -188,6 +190,10 @@ func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in Regis
 		INSERT INTO sessions(session_id, team_id, agent_id, principal, active, created_at)
 		VALUES($1,$2,$3,$4,true,$5)`,
 		sessionID, in.TeamID, in.AgentID, p.Subject, now); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_sessions_one_active" {
+			return nil, model.NewError("SESSION_CONFLICT", "active session exists; set replace_existing_session=true to rotate", nil)
+		}
 		return nil, model.NewError("INTERNAL_ERROR", "failed to create session", map[string]any{"error": err.Error()})
 	}
 
@@ -201,6 +207,10 @@ func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in Regis
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to commit registration", map[string]any{"error": err.Error()})
+	}
+
+	if s.notifier != nil {
+		s.notifier.EnsureTeam(ctx, in.TeamID)
 	}
 
 	return map[string]any{
@@ -365,6 +375,23 @@ func (s *Service) SendMessage(ctx context.Context, p model.Principal, in SendInp
 		return nil, model.NewError("INTERNAL_ERROR", "failed to commit message", map[string]any{"error": err.Error()})
 	}
 
+	if s.notifier != nil {
+		for _, r := range recipients {
+			payload, _ := json.Marshal(map[string]string{
+				"team_id":  sess.TeamID,
+				"agent_id": r.AgentID,
+			})
+			_, _ = s.db.Exec(ctx, "SELECT pg_notify($1, $2)",
+				channelName(sess.TeamID), string(payload))
+			var sid string
+			if err := s.db.QueryRow(ctx,
+				`SELECT session_id FROM sessions WHERE team_id=$1 AND agent_id=$2 AND active=true LIMIT 1`,
+				sess.TeamID, r.AgentID).Scan(&sid); err == nil {
+				s.notifier.SendResourceNotification(sid)
+			}
+		}
+	}
+
 	return map[string]any{
 		"message_id":      msgID,
 		"accepted_at":     now.Format(time.RFC3339Nano),
@@ -411,7 +438,17 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 	var rows []map[string]any
 	var nextCursor string
 	var snapshotAt time.Time
+
+	if s.notifier != nil {
+		s.notifier.EnsureTeam(ctx, sess.TeamID)
+	}
+
 	for {
+		var waitCh <-chan struct{}
+		if s.notifier != nil && !s.notifier.IsFallback() {
+			waitCh = s.notifier.WaitCh(sess.TeamID, sess.AgentID)
+		}
+
 		rows, nextCursor, snapshotAt, aerr = s.fetchPollPage(ctx, sess, minPriority, maxMessages, in.Cursor)
 		if aerr != nil {
 			return nil, aerr
@@ -419,7 +456,16 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 		if len(rows) > 0 || waitMS == 0 || time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		if waitCh != nil {
+			waitCtx, waitCancel := context.WithDeadline(ctx, deadline)
+			select {
+			case <-waitCh:
+			case <-waitCtx.Done():
+			}
+			waitCancel()
+		} else {
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 
 	var hasUrgent bool
@@ -452,6 +498,111 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 		"recommended_poll_ms":  recommended,
 		"protocol_description": "snapshot-scoped keyset pagination",
 	}, nil
+}
+
+func (s *Service) PeekInbox(ctx context.Context, p model.Principal, sessionID string, minPriority int) ([]map[string]any, *model.APIError) {
+	sess, aerr := s.requireSession(ctx, sessionID, "")
+	if aerr != nil {
+		return nil, aerr
+	}
+	if p.TeamID != "" && p.TeamID != sess.TeamID {
+		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
+			"expected_team": p.TeamID,
+			"session_team":  sess.TeamID,
+		})
+	}
+	if !p.HasScope("*") && !p.HasScope("poll:self") {
+		return nil, model.NewError("INVALID_INPUT", "missing poll:self scope", nil)
+	}
+
+	const limit = 20
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			d.message_id,
+			m.from_agent_id,
+			m.priority,
+			m.topic,
+			m.body,
+			COALESCE(m.in_reply_to,''),
+			m.attachments::text,
+			m.created_at,
+			m.ttl_seconds,
+			m.require_ack,
+			m.read_receipt,
+			m.to_type,
+			COALESCE(m.to_value,''),
+			d.state,
+			d.delivered_at,
+			d.acked_at
+		FROM deliveries d
+		JOIN messages m ON m.message_id=d.message_id
+		WHERE d.team_id=$1
+		  AND d.recipient_agent_id=$2
+		  AND d.state IN ('PENDING','DELIVERED')
+		  AND m.cancelled=false
+		  AND m.expires_at > now()
+		  AND m.priority >= $3
+		ORDER BY m.priority DESC, m.created_at ASC, m.message_id ASC
+		LIMIT $4`,
+		sess.TeamID, sess.AgentID, minPriority, limit)
+	if err != nil {
+		return nil, model.NewError("INTERNAL_ERROR", "failed to peek inbox", map[string]any{"error": err.Error()})
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var (
+			messageID, fromAgentID, topic, body, inReplyTo string
+			attachRaw, readReceipt, toType, toValue, state string
+			priority, ttlSeconds                           int
+			requireAck                                     bool
+			createdAt                                      time.Time
+			deliveredAt, ackedAt                           *time.Time
+		)
+		if err := rows.Scan(
+			&messageID, &fromAgentID, &priority, &topic, &body, &inReplyTo,
+			&attachRaw, &createdAt, &ttlSeconds, &requireAck, &readReceipt,
+			&toType, &toValue, &state, &deliveredAt, &ackedAt); err != nil {
+			return nil, model.NewError("INTERNAL_ERROR", "failed to scan peek row", map[string]any{"error": err.Error()})
+		}
+
+		attachments := []map[string]any{}
+		_ = json.Unmarshal([]byte(attachRaw), &attachments)
+
+		to := map[string]any{}
+		switch toType {
+		case "direct":
+			to["type"] = "direct"
+			to["agent_id"] = toValue
+		case "broadcast_team":
+			to["type"] = "broadcast"
+			to["scope"] = "team"
+		case "broadcast_tag":
+			to["type"] = "broadcast"
+			to["scope"] = "tag"
+			to["tag"] = toValue
+		}
+
+		out = append(out, map[string]any{
+			"message_id":     messageID,
+			"team_id":        sess.TeamID,
+			"from_agent_id":  fromAgentID,
+			"to":             to,
+			"priority":       priority,
+			"topic":          topic,
+			"body":           body,
+			"in_reply_to":    nullable(inReplyTo),
+			"attachments":    attachments,
+			"created_at":     createdAt.Format(time.RFC3339Nano),
+			"ttl_seconds":    ttlSeconds,
+			"delivery_state": state,
+			"delivered_at":   toRFC3339(deliveredAt),
+			"acked_at":       toRFC3339(ackedAt),
+			"read_receipt":   readReceipt,
+		})
+	}
+	return out, nil
 }
 
 func (s *Service) AckMessages(ctx context.Context, p model.Principal, in AckInput) (map[string]any, *model.APIError) {

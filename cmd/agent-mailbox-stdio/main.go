@@ -4,8 +4,10 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -27,7 +29,8 @@ func main() {
 		log.Printf("generated %d bootstrap token(s); plaintext secrets written to %s", len(cfg.BootstrapTokenSecrets), cfg.BootstrapTokensFile)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	st, err := store.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("db connect error: %v", err)
@@ -38,7 +41,8 @@ func main() {
 		log.Fatalf("migration error: %v", err)
 	}
 
-	svc := service.New(st.DB, cfg)
+	notifier := service.NewNotifier(st.DB)
+	svc := service.New(st.DB, cfg, notifier)
 	reg := auth.NewRegistry(cfg)
 	reg.Start(ctx)
 
@@ -47,6 +51,9 @@ func main() {
 		return reg.LookupToken(token)
 	}
 	mcpSvc := mcpserver.NewMailboxServer(svc, resolver)
+	notifier.SetMCPServer(mcpSvc)
+
+	go notifier.Run(ctx)
 
 	go runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
 		if err := svc.SweepInactivity(ctx); err != nil {
@@ -65,8 +72,10 @@ func main() {
 	})
 
 	if err := server.ServeStdio(mcpSvc); err != nil {
+		cancel()
 		log.Fatalf("stdio server error: %v", err)
 	}
+	cancel()
 }
 
 func runTicker(ctx context.Context, every time.Duration, fn func(context.Context)) {

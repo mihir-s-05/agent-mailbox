@@ -18,7 +18,10 @@ import (
 type PrincipalResolver func(context.Context) (model.Principal, bool)
 
 func NewMailboxServer(svc *service.Service, resolver PrincipalResolver) *server.MCPServer {
-	s := server.NewMCPServer("agent-mailbox", "1.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("agent-mailbox", "1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithResourceCapabilities(true, true),
+	)
 
 	s.AddTool(newRegisterTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
 		in := service.RegisterInput{
@@ -119,7 +122,80 @@ func NewMailboxServer(svc *service.Service, resolver PrincipalResolver) *server.
 		return svc.GetMessageLog(ctx, p, in)
 	}))
 
+	s.AddResourceTemplate(
+		mcp.NewResourceTemplate(
+			"mailbox://inbox/{session_id}",
+			"Agent Inbox",
+			mcp.WithTemplateDescription("Pending messages in the agent's mailbox (read-only, no state changes)."),
+			mcp.WithTemplateMIMEType("application/json"),
+		),
+		inboxResourceHandler(svc, resolver, 0),
+	)
+	s.AddResourceTemplate(
+		mcp.NewResourceTemplate(
+			"mailbox://inbox/{session_id}/urgent",
+			"Urgent Inbox",
+			mcp.WithTemplateDescription("Only urgent (priority=3) pending messages."),
+			mcp.WithTemplateMIMEType("application/json"),
+		),
+		inboxResourceHandler(svc, resolver, 3),
+	)
+
 	return s
+}
+
+func inboxResourceHandler(svc *service.Service, resolver PrincipalResolver, minPriority int) server.ResourceTemplateHandlerFunc {
+	return func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		sessionID := extractSessionID(req.Params.URI)
+		if sessionID == "" {
+			return nil, fmt.Errorf("missing session_id in resource URI")
+		}
+
+		var (
+			p  model.Principal
+			ok bool
+		)
+		if resolver != nil {
+			p, ok = resolver(ctx)
+		}
+		if !ok {
+			p, ok = auth.FromContext(ctx)
+		}
+		if !ok {
+			return nil, fmt.Errorf("unauthenticated")
+		}
+
+		messages, apiErr := svc.PeekInbox(ctx, p, sessionID, minPriority)
+		if apiErr != nil {
+			return nil, fmt.Errorf("%s: %s", apiErr.Code, apiErr.Message)
+		}
+
+		data, _ := json.Marshal(map[string]any{
+			"messages": messages,
+			"count":    len(messages),
+		})
+		return []mcp.ResourceContents{
+			mcp.TextResourceContents{
+				URI:      req.Params.URI,
+				MIMEType: "application/json",
+				Text:     string(data),
+			},
+		}, nil
+	}
+}
+
+func extractSessionID(uri string) string {
+	const prefix = "mailbox://inbox/"
+	if !strings.HasPrefix(uri, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(uri, prefix)
+	rest = strings.TrimSuffix(rest, "/urgent")
+	rest = strings.TrimSpace(rest)
+	if rest == "" || strings.Contains(rest, "/") {
+		return ""
+	}
+	return rest
 }
 
 type toolFn func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError)
