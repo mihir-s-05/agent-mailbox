@@ -147,7 +147,10 @@ func (n *Notifier) runOnce(ctx context.Context) {
 	}
 
 	n.fallback.Store(false)
-	log.Printf("notifier: listening on %d team channel(s)", len(n.teams))
+	n.mu.Lock()
+	teamCount := len(n.teams)
+	n.mu.Unlock()
+	log.Printf("notifier: listening on %d team channel(s)", teamCount)
 
 	for {
 		if ctx.Err() != nil {

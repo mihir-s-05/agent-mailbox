@@ -4,8 +4,10 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mark3labs/mcp-go/server"
@@ -27,7 +29,8 @@ func main() {
 		log.Printf("generated %d bootstrap token(s); plaintext secrets written to %s", len(cfg.BootstrapTokenSecrets), cfg.BootstrapTokensFile)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	st, err := store.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Fatalf("db connect error: %v", err)
@@ -69,8 +72,10 @@ func main() {
 	})
 
 	if err := server.ServeStdio(mcpSvc); err != nil {
+		cancel()
 		log.Fatalf("stdio server error: %v", err)
 	}
+	cancel()
 }
 
 func runTicker(ctx context.Context, every time.Duration, fn func(context.Context)) {
