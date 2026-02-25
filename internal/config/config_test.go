@@ -195,6 +195,33 @@ func TestLoadFailsOnInvalidIntegerEnv(t *testing.T) {
 	}
 }
 
+func TestLoadFailsOnNegativeIntegerEnv(t *testing.T) {
+	setenv(t, "MAILBOX_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_mailbox?sslmode=disable")
+	setenv(t, "MAILBOX_REQUIRE_MTLS", "false")
+	setenv(t, "MAILBOX_MAX_BODY_BYTES", "-1")
+	setenv(t, "MAILBOX_TOKENS", "inline-token=dev-team:poll:self|1h")
+	setenv(t, "MAILBOX_ALLOW_PLAINTEXT_TOKENS", "true")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "MAILBOX_MAX_BODY_BYTES must be greater than zero") {
+		t.Fatalf("expected negative integer validation error, got %v", err)
+	}
+}
+
+func TestLoadFailsWhenMaxTTLIsSmallerThanDefaultTTL(t *testing.T) {
+	setenv(t, "MAILBOX_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_mailbox?sslmode=disable")
+	setenv(t, "MAILBOX_REQUIRE_MTLS", "false")
+	setenv(t, "MAILBOX_DEFAULT_TTL_SECONDS", "120")
+	setenv(t, "MAILBOX_MAX_TTL_SECONDS", "60")
+	setenv(t, "MAILBOX_TOKENS", "inline-token=dev-team:poll:self|1h")
+	setenv(t, "MAILBOX_ALLOW_PLAINTEXT_TOKENS", "true")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "MAILBOX_MAX_TTL_SECONDS must be greater than or equal to MAILBOX_DEFAULT_TTL_SECONDS") {
+		t.Fatalf("expected ttl bound validation error, got %v", err)
+	}
+}
+
 func TestLoadFailsOnInvalidBooleanEnv(t *testing.T) {
 	setenv(t, "MAILBOX_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_mailbox?sslmode=disable")
 	setenv(t, "MAILBOX_REQUIRE_MTLS", "maybe")
@@ -204,6 +231,18 @@ func TestLoadFailsOnInvalidBooleanEnv(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "MAILBOX_REQUIRE_MTLS has invalid boolean") {
 		t.Fatalf("expected invalid boolean error, got %v", err)
+	}
+}
+
+func TestLoadFailsWhenInlineTokenScopesAreBlank(t *testing.T) {
+	setenv(t, "MAILBOX_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_mailbox?sslmode=disable")
+	setenv(t, "MAILBOX_REQUIRE_MTLS", "false")
+	setenv(t, "MAILBOX_TOKENS", "inline-token=dev-team: , , ")
+	setenv(t, "MAILBOX_ALLOW_PLAINTEXT_TOKENS", "true")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "must include at least one scope") {
+		t.Fatalf("expected inline scope validation error, got %v", err)
 	}
 }
 

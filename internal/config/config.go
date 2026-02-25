@@ -206,6 +206,36 @@ func Load() (Config, error) {
 	if cfg.BootstrapTokenCount <= 0 {
 		return Config{}, errors.New("MAILBOX_BOOTSTRAP_TOKEN_COUNT must be greater than zero")
 	}
+	if cfg.DefaultPollMS <= 0 {
+		return Config{}, errors.New("MAILBOX_DEFAULT_POLL_MS must be greater than zero")
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		return Config{}, errors.New("MAILBOX_MAX_BODY_BYTES must be greater than zero")
+	}
+	if cfg.MaxAttachments < 0 {
+		return Config{}, errors.New("MAILBOX_MAX_ATTACHMENTS must be zero or greater")
+	}
+	if cfg.MaxBroadcastRecipients < 0 {
+		return Config{}, errors.New("MAILBOX_MAX_BROADCAST_RECIPIENTS must be zero or greater")
+	}
+	if cfg.MailboxCap <= 0 {
+		return Config{}, errors.New("MAILBOX_MAILBOX_CAP must be greater than zero")
+	}
+	if cfg.RateLimitPerMinute <= 0 {
+		return Config{}, errors.New("MAILBOX_RATE_LIMIT_PER_MIN must be greater than zero")
+	}
+	if cfg.DefaultTTLSeconds <= 0 {
+		return Config{}, errors.New("MAILBOX_DEFAULT_TTL_SECONDS must be greater than zero")
+	}
+	if cfg.MaxTTLSeconds <= 0 {
+		return Config{}, errors.New("MAILBOX_MAX_TTL_SECONDS must be greater than zero")
+	}
+	if cfg.MaxTTLSeconds < cfg.DefaultTTLSeconds {
+		return Config{}, errors.New("MAILBOX_MAX_TTL_SECONDS must be greater than or equal to MAILBOX_DEFAULT_TTL_SECONDS")
+	}
+	if cfg.TokenReloadInterval < 0 {
+		return Config{}, errors.New("MAILBOX_TOKEN_RELOAD_INTERVAL must be zero or greater")
+	}
 	if cfg.BootstrapTokenTTL <= 0 {
 		return Config{}, errors.New("MAILBOX_BOOTSTRAP_TOKEN_TTL must be greater than zero")
 	}
@@ -317,6 +347,9 @@ func parseInlineTokens(raw string, defaultTTL time.Duration, now time.Time) ([]T
 			if s != "" {
 				scopes = append(scopes, s)
 			}
+		}
+		if len(scopes) == 0 {
+			return nil, fmt.Errorf("MAILBOX_TOKENS entry %q must include at least one scope", p)
 		}
 		expires := now.Add(tokenTTL)
 		created := now

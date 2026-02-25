@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,10 @@ type Service struct {
 
 	rlMu       sync.Mutex
 	rateWindow map[string]rateState
+	lastPrune  time.Time
+
+	ulidMu      sync.Mutex
+	ulidEntropy io.Reader
 }
 
 type rateState struct {
@@ -119,10 +125,11 @@ type recipient struct {
 
 func New(db *pgxpool.Pool, cfg config.Config, notifier *Notifier) *Service {
 	return &Service{
-		db:         db,
-		cfg:        cfg,
-		notifier:   notifier,
-		rateWindow: map[string]rateState{},
+		db:          db,
+		cfg:         cfg,
+		notifier:    notifier,
+		rateWindow:  map[string]rateState{},
+		ulidEntropy: ulid.Monotonic(rand.Reader, 0),
 	}
 }
 
@@ -314,7 +321,7 @@ func (s *Service) SendMessage(ctx context.Context, p model.Principal, in SendInp
 		}
 	}
 
-	msgID := newULID(now)
+	msgID := s.newULID(now)
 	attJSON, _ := json.Marshal(in.Attachments)
 	expiresAt := now.Add(time.Duration(in.TTLSeconds) * time.Second)
 
@@ -348,6 +355,10 @@ func (s *Service) SendMessage(ctx context.Context, p model.Principal, in SendInp
 					"deduplicated":    true,
 				}, nil
 			}
+			return nil, model.NewError("INTERNAL_ERROR", "idempotency conflict detected but existing message lookup failed", map[string]any{
+				"insert_error": err.Error(),
+				"lookup_error": lookupErr.Error(),
+			})
 		}
 		return nil, model.NewError("INTERNAL_ERROR", "failed to insert message", map[string]any{"error": err.Error()})
 	}
@@ -381,8 +392,10 @@ func (s *Service) SendMessage(ctx context.Context, p model.Principal, in SendInp
 				"team_id":  sess.TeamID,
 				"agent_id": r.AgentID,
 			})
-			_, _ = s.db.Exec(ctx, "SELECT pg_notify($1, $2)",
-				channelName(sess.TeamID), string(payload))
+			if _, err := s.db.Exec(ctx, "SELECT pg_notify($1, $2)",
+				channelName(sess.TeamID), string(payload)); err != nil {
+				log.Printf("notify delivery failed team=%s recipient=%s message=%s: %v", sess.TeamID, r.AgentID, msgID, err)
+			}
 			var sid string
 			if err := s.db.QueryRow(ctx,
 				`SELECT session_id FROM sessions WHERE team_id=$1 AND agent_id=$2 AND active=true LIMIT 1`,
@@ -510,6 +523,9 @@ func (s *Service) PeekInbox(ctx context.Context, p model.Principal, sessionID st
 			"expected_team": p.TeamID,
 			"session_team":  sess.TeamID,
 		})
+	}
+	if strings.TrimSpace(p.Subject) == "" || p.Subject != sess.Principal {
+		return nil, model.NewError("SESSION_INVALID", "session_id does not belong to authenticated principal", nil)
 	}
 	if !p.HasScope("*") && !p.HasScope("poll:self") {
 		return nil, model.NewError("INVALID_INPUT", "missing poll:self scope", nil)
@@ -668,10 +684,12 @@ func (s *Service) AckMessages(ctx context.Context, p model.Principal, in AckInpu
 			now, sess.TeamID, sess.AgentID, id); err != nil {
 			return nil, model.NewError("INTERNAL_ERROR", "failed to ack message", map[string]any{"error": err.Error()})
 		}
-		_, _ = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
 			VALUES($1,$2,$3,$4,'ACKED',$5,'{}'::jsonb)`,
-			uuid.NewString(), sess.TeamID, id, sess.AgentID, now)
+			uuid.NewString(), sess.TeamID, id, sess.AgentID, now); err != nil {
+			return nil, model.NewError("INTERNAL_ERROR", "failed to record ack event", map[string]any{"error": err.Error()})
+		}
 		acked = append(acked, id)
 	}
 
@@ -807,6 +825,9 @@ func (s *Service) CancelMessage(ctx context.Context, p model.Principal, in Cance
 			"session_team":  sess.TeamID,
 		})
 	}
+	if !p.HasScope("*") && !p.HasScope("send:any") && !p.HasScope("send:direct") && !p.HasScope("send:broadcast") {
+		return nil, model.NewError("INVALID_INPUT", "missing send scope for cancellation", nil)
+	}
 
 	var teamID, fromAgent string
 	err := s.db.QueryRow(ctx, `
@@ -843,11 +864,15 @@ func (s *Service) CancelMessage(ctx context.Context, p model.Principal, in Cance
 		return nil, model.NewError("INTERNAL_ERROR", "failed to count acked deliveries", map[string]any{"error": err.Error()})
 	}
 	if cancelledCount > 0 {
-		_, _ = tx.Exec(ctx, `UPDATE messages SET cancelled=true WHERE message_id=$1`, in.MessageID)
-		_, _ = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `UPDATE messages SET cancelled=true WHERE message_id=$1`, in.MessageID); err != nil {
+			return nil, model.NewError("INTERNAL_ERROR", "failed to mark message cancelled", map[string]any{"error": err.Error()})
+		}
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
 			VALUES($1,$2,$3,NULL,'CANCELLED',$4,$5::jsonb)`,
-			uuid.NewString(), teamID, in.MessageID, time.Now().UTC(), `{"scope":"bulk"}`)
+			uuid.NewString(), teamID, in.MessageID, time.Now().UTC(), `{"scope":"bulk"}`); err != nil {
+			return nil, model.NewError("INTERNAL_ERROR", "failed to record cancellation event", map[string]any{"error": err.Error()})
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to commit cancellation", map[string]any{"error": err.Error()})
@@ -878,6 +903,9 @@ func (s *Service) SetAgentStatus(ctx context.Context, p model.Principal, in Stat
 			"session_team":  sess.TeamID,
 		})
 	}
+	if !p.HasScope("*") && !p.HasScope("status:write") {
+		return nil, model.NewError("INVALID_INPUT", "missing status:write scope", nil)
+	}
 	status := strings.ToLower(strings.TrimSpace(in.Status))
 	if status == "" {
 		return nil, model.NewError("INVALID_INPUT", "status is required", nil)
@@ -906,6 +934,9 @@ func (s *Service) GetMessageLog(ctx context.Context, p model.Principal, in LogIn
 			"expected_team": p.TeamID,
 			"session_team":  sess.TeamID,
 		})
+	}
+	if !p.HasScope("*") && !p.HasScope("log:read") {
+		return nil, model.NewError("INVALID_INPUT", "missing log:read scope", nil)
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -997,10 +1028,12 @@ func (s *Service) SweepExpiry(ctx context.Context) error {
 		if err := rows.Scan(&teamID, &messageID, &recipient); err != nil {
 			return err
 		}
-		_, _ = tx.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
 			VALUES($1,$2,$3,$4,'EXPIRED',$5,'{}'::jsonb)`,
-			uuid.NewString(), teamID, messageID, recipient, now)
+			uuid.NewString(), teamID, messageID, recipient, now); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -1047,11 +1080,21 @@ func (s *Service) requireSession(ctx context.Context, sessionID, explicitTeam st
 		})
 	}
 
-	_, _ = s.db.Exec(ctx, `
+	cmd, err := s.db.Exec(ctx, `
 		UPDATE agents
 		SET last_seen_at=$1, online=true
 		WHERE team_id=$2 AND agent_id=$3`,
 		time.Now().UTC(), sess.TeamID, sess.AgentID)
+	if err != nil {
+		return sessionRow{}, model.NewError("INTERNAL_ERROR", "failed to update agent presence", map[string]any{"error": err.Error()})
+	}
+	if cmd.RowsAffected() == 0 {
+		return sessionRow{}, model.NewError("SESSION_INVALID", "session has no matching active agent", map[string]any{
+			"session_id": sess.SessionID,
+			"team_id":    sess.TeamID,
+			"agent_id":   sess.AgentID,
+		})
+	}
 	return sess, nil
 }
 
@@ -1121,7 +1164,8 @@ func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string
 }
 
 func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriority, max int, cursor string) ([]map[string]any, string, time.Time, *model.APIError) {
-	snapshotAt := time.Now().UTC()
+	nowUTC := time.Now().UTC()
+	snapshotAt := nowUTC
 	lastPriority := 0
 	lastCreated := time.Time{}
 	lastMessageID := ""
@@ -1130,7 +1174,19 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 		if err != nil {
 			return nil, "", time.Time{}, model.NewError("INVALID_INPUT", "invalid cursor", map[string]any{"error": err.Error()})
 		}
+		if c.SnapshotAt.IsZero() || c.LastCreatedAt.IsZero() || strings.TrimSpace(c.LastMessageID) == "" {
+			return nil, "", time.Time{}, model.NewError("INVALID_INPUT", "cursor is missing required fields", nil)
+		}
+		if c.LastPriority < 0 || c.LastPriority > 3 {
+			return nil, "", time.Time{}, model.NewError("INVALID_INPUT", "cursor priority out of range", map[string]any{"last_priority": c.LastPriority})
+		}
 		snapshotAt = c.SnapshotAt.UTC()
+		if snapshotAt.After(nowUTC.Add(2 * time.Second)) {
+			return nil, "", time.Time{}, model.NewError("INVALID_INPUT", "cursor snapshot_at is in the future", nil)
+		}
+		if s.cfg.RetentionWindow > 0 && snapshotAt.Before(nowUTC.Add(-s.cfg.RetentionWindow)) {
+			return nil, "", time.Time{}, model.NewError("INVALID_INPUT", "cursor snapshot_at is outside retention window", nil)
+		}
 		lastPriority = c.LastPriority
 		lastCreated = c.LastCreatedAt.UTC()
 		lastMessageID = c.LastMessageID
@@ -1239,9 +1295,13 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 		ackedAt := item.AckedAt
 
 		if item.State == model.DeliveryPending {
-			state, deliveredAt, ackedAt = s.applyPendingDeliveryTransition(
-				ctx, sess, item.MessageID, item.RequireAck, ackedAt, now,
+			var transitionErr *model.APIError
+			state, deliveredAt, ackedAt, transitionErr = s.applyPendingDeliveryTransition(
+				ctx, sess, item.MessageID, item.RequireAck, now,
 			)
+			if transitionErr != nil {
+				return nil, "", time.Time{}, transitionErr
+			}
 		}
 
 		attachments := []map[string]any{}
@@ -1338,46 +1398,108 @@ func (s *Service) applyPendingDeliveryTransition(
 	sess sessionRow,
 	messageID string,
 	requireAck bool,
-	ackedAt *time.Time,
 	now time.Time,
-) (string, *time.Time, *time.Time) {
+) (string, *time.Time, *time.Time, *model.APIError) {
 	if requireAck {
-		deliveredAt := s.markDeliveredOnPoll(ctx, sess, messageID, now)
-		return model.DeliveryDelivered, deliveredAt, ackedAt
+		return s.markDeliveredOnPoll(ctx, sess, messageID, now)
 	}
-	deliveredAt, autoAckedAt := s.autoAckOnPoll(ctx, sess, messageID, now)
-	return model.DeliveryAcked, deliveredAt, autoAckedAt
+	return s.autoAckOnPoll(ctx, sess, messageID, now)
 }
 
-func (s *Service) markDeliveredOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) *time.Time {
-	_, _ = s.db.Exec(ctx, `
+func (s *Service) markDeliveredOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) (string, *time.Time, *time.Time, *model.APIError) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to begin delivery transition", map[string]any{"error": err.Error()})
+	}
+	defer tx.Rollback(ctx)
+
+	var deliveredAt *time.Time
+	err = tx.QueryRow(ctx, `
 		UPDATE deliveries
 		SET state='DELIVERED', delivered_at=COALESCE(delivered_at,$1)
-		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4`,
-		now, messageID, sess.AgentID, sess.TeamID)
-	_, _ = s.db.Exec(ctx, `
+		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4 AND state='PENDING'
+		RETURNING delivered_at`,
+		now, messageID, sess.AgentID, sess.TeamID).Scan(&deliveredAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		state, curDeliveredAt, ackedAt, loadErr := s.loadDeliveryStateForPollTx(ctx, tx, sess, messageID)
+		if loadErr != nil {
+			return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to read delivery after transition race", map[string]any{"error": loadErr.Error()})
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to commit delivery transition", map[string]any{"error": err.Error()})
+		}
+		return state, curDeliveredAt, ackedAt, nil
+	}
+	if err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to mark delivery on poll", map[string]any{"error": err.Error()})
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
 		VALUES($1,$2,$3,$4,'DELIVERED',$5,'{}'::jsonb)`,
-		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now)
-	deliveredAt := now
-	return &deliveredAt
+		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now); err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to record delivered event", map[string]any{"error": err.Error()})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to commit delivery transition", map[string]any{"error": err.Error()})
+	}
+	return model.DeliveryDelivered, deliveredAt, nil, nil
 }
 
-func (s *Service) autoAckOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) (*time.Time, *time.Time) {
-	_, _ = s.db.Exec(ctx, `
+func (s *Service) autoAckOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) (string, *time.Time, *time.Time, *model.APIError) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to begin auto-ack transition", map[string]any{"error": err.Error()})
+	}
+	defer tx.Rollback(ctx)
+
+	var deliveredAt, ackedAt *time.Time
+	err = tx.QueryRow(ctx, `
 		UPDATE deliveries
 		SET state='ACKED',
 		    delivered_at=COALESCE(delivered_at,$1),
 		    acked_at=COALESCE(acked_at,$1)
-		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4`,
-		now, messageID, sess.AgentID, sess.TeamID)
-	_, _ = s.db.Exec(ctx, `
+		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4 AND state='PENDING'
+		RETURNING delivered_at, acked_at`,
+		now, messageID, sess.AgentID, sess.TeamID).Scan(&deliveredAt, &ackedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		state, curDeliveredAt, curAckedAt, loadErr := s.loadDeliveryStateForPollTx(ctx, tx, sess, messageID)
+		if loadErr != nil {
+			return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to read delivery after auto-ack race", map[string]any{"error": loadErr.Error()})
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to commit auto-ack transition", map[string]any{"error": err.Error()})
+		}
+		return state, curDeliveredAt, curAckedAt, nil
+	}
+	if err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to auto-ack delivery on poll", map[string]any{"error": err.Error()})
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
 		VALUES($1,$2,$3,$4,'DELIVERED',$5,'{}'::jsonb),($6,$2,$3,$4,'ACKED',$5,'{}'::jsonb)`,
-		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now, uuid.NewString())
-	deliveredAt := now
-	ackedAt := now
-	return &deliveredAt, &ackedAt
+		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now, uuid.NewString()); err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to record auto-ack events", map[string]any{"error": err.Error()})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", nil, nil, model.NewError("INTERNAL_ERROR", "failed to commit auto-ack transition", map[string]any{"error": err.Error()})
+	}
+	return model.DeliveryAcked, deliveredAt, ackedAt, nil
+}
+
+func (s *Service) loadDeliveryStateForPollTx(ctx context.Context, tx pgx.Tx, sess sessionRow, messageID string) (string, *time.Time, *time.Time, error) {
+	var (
+		state                string
+		deliveredAt, ackedAt *time.Time
+	)
+	err := tx.QueryRow(ctx, `
+		SELECT state, delivered_at, acked_at
+		FROM deliveries
+		WHERE message_id=$1 AND recipient_agent_id=$2 AND team_id=$3`,
+		messageID, sess.AgentID, sess.TeamID).Scan(&state, &deliveredAt, &ackedAt)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return state, deliveredAt, ackedAt, nil
 }
 
 func (s *Service) takeRateLimit(key string) bool {
@@ -1385,6 +1507,10 @@ func (s *Service) takeRateLimit(key string) bool {
 	defer s.rlMu.Unlock()
 
 	now := time.Now().UTC()
+	if s.lastPrune.IsZero() || now.Sub(s.lastPrune) >= time.Minute {
+		s.pruneRateWindow(now)
+		s.lastPrune = now
+	}
 	b := s.rateWindow[key]
 	if b.WindowStart.IsZero() || now.Sub(b.WindowStart) >= time.Minute {
 		s.rateWindow[key] = rateState{WindowStart: now, Count: 1}
@@ -1398,9 +1524,19 @@ func (s *Service) takeRateLimit(key string) bool {
 	return true
 }
 
-func newULID(now time.Time) string {
-	entropy := ulid.Monotonic(rand.Reader, 0)
-	return ulid.MustNew(ulid.Timestamp(now), entropy).String()
+func (s *Service) pruneRateWindow(now time.Time) {
+	const staleAfter = 5 * time.Minute
+	for key, bucket := range s.rateWindow {
+		if bucket.WindowStart.IsZero() || now.Sub(bucket.WindowStart) >= staleAfter {
+			delete(s.rateWindow, key)
+		}
+	}
+}
+
+func (s *Service) newULID(now time.Time) string {
+	s.ulidMu.Lock()
+	defer s.ulidMu.Unlock()
+	return ulid.MustNew(ulid.Timestamp(now), s.ulidEntropy).String()
 }
 
 func normalizeStringSlice(in []string) []string {

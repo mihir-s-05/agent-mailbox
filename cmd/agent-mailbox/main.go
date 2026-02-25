@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -81,25 +82,40 @@ func main() {
 		httpSrv.TLSConfig = tlsCfg
 	}
 
-	go notifier.Run(ctx)
+	var bgWG sync.WaitGroup
+	startBackground := func(fn func()) {
+		bgWG.Add(1)
+		go func() {
+			defer bgWG.Done()
+			fn()
+		}()
+	}
 
-	go runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
-		if err := svc.SweepInactivity(ctx); err != nil {
-			log.Printf("inactivity sweep error: %v", err)
-		}
+	startBackground(func() { notifier.Run(ctx) })
+
+	startBackground(func() {
+		runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
+			if err := svc.SweepInactivity(ctx); err != nil {
+				log.Printf("inactivity sweep error: %v", err)
+			}
+		})
 	})
-	go runTicker(ctx, cfg.ExpirySweepInterval, func(ctx context.Context) {
-		if err := svc.SweepExpiry(ctx); err != nil {
-			log.Printf("expiry sweep error: %v", err)
-		}
+	startBackground(func() {
+		runTicker(ctx, cfg.ExpirySweepInterval, func(ctx context.Context) {
+			if err := svc.SweepExpiry(ctx); err != nil {
+				log.Printf("expiry sweep error: %v", err)
+			}
+		})
 	})
-	go runTicker(ctx, cfg.RetentionSweepInterval, func(ctx context.Context) {
-		if err := svc.SweepRetention(ctx); err != nil {
-			log.Printf("retention sweep error: %v", err)
-		}
+	startBackground(func() {
+		runTicker(ctx, cfg.RetentionSweepInterval, func(ctx context.Context) {
+			if err := svc.SweepRetention(ctx); err != nil {
+				log.Printf("retention sweep error: %v", err)
+			}
+		})
 	})
 
-	go func() {
+	startBackground(func() {
 		var err error
 		if cfg.RequireMTLS {
 			log.Printf("agent-mailbox listening with mTLS on https://127.0.0.1%s%s", cfg.Address, cfg.BasePath)
@@ -111,12 +127,13 @@ func main() {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("http server error: %v", err)
 		}
-	}()
+	})
 
 	<-ctx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	bgWG.Wait()
 }
 
 func runTicker(ctx context.Context, every time.Duration, fn func(context.Context)) {

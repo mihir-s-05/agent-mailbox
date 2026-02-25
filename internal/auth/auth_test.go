@@ -131,3 +131,9 @@ func TestReloadAppliesRevokedFlag(t *testing.T) {
 func timePtr(v time.Time) *time.Time {
 	return &v
 }
+
+func TestStatusForCodeInternalErrorMapsTo500(t *testing.T) {
+	if got := statusForCode("INTERNAL_ERROR"); got != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for INTERNAL_ERROR, got %d", got)
+	}
+}

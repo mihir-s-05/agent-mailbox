@@ -56,13 +56,6 @@ func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
 	}
 
 	for _, name := range names {
-		var exists bool
-		if err := s.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=$1)`, name).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			continue
-		}
 		path := filepath.Join(dir, name)
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -72,13 +65,18 @@ func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
 		if err != nil {
 			return err
 		}
+		lockInsert, err := tx.Exec(ctx, `INSERT INTO schema_migrations(name) VALUES($1) ON CONFLICT DO NOTHING`, name)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if lockInsert.RowsAffected() == 0 {
+			_ = tx.Rollback(ctx)
+			continue
+		}
 		if _, err := tx.Exec(ctx, string(b)); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations(name) VALUES($1)`, name); err != nil {
-			_ = tx.Rollback(ctx)
-			return err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return err

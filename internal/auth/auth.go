@@ -135,6 +135,7 @@ func (r *Registry) lookup(token string) (model.Principal, bool, bool, bool) {
 	r.mu.RLock()
 	entry, ok := r.tokens[hash]
 	r.mu.RUnlock()
+
 	if !ok {
 		return model.Principal{}, false, false, false
 	}
@@ -212,6 +213,8 @@ func statusForCode(code string) int {
 		return http.StatusForbidden
 	case "TEAM_NOT_FOUND", "AGENT_NOT_FOUND":
 		return http.StatusNotFound
+	case "INTERNAL_ERROR":
+		return http.StatusInternalServerError
 	default:
 		return http.StatusBadRequest
 	}

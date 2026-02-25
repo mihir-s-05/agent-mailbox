@@ -94,6 +94,11 @@ $env:MAILBOX_TOKEN = "<token-from-tokens.local.secrets.json>"
 
 `scopes` must be explicit and non-empty.
 
+If you use optional tools, add matching scopes:
+- `cancel_message`: `send:any` or `send:direct` or `send:broadcast` (or `*`)
+- `set_agent_status`: `status:write` (or `*`)
+- `get_message_log`: `log:read` (or `*`)
+
 ## Docs
 
 Detailed setup and troubleshooting: [`docs/INSTALL.md`](docs/INSTALL.md)

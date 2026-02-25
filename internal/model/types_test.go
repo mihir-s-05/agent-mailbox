@@ -1,6 +1,7 @@
 package model
 
 import (
+	"strconv"
 	"testing"
 	"time"
 )
@@ -17,6 +18,7 @@ func TestParsePriority(t *testing.T) {
 		{"high enum", "HIGH", 2, false},
 		{"urgent enum", "URGENT", 3, false},
 		{"int", 2, 2, false},
+		{"int64", int64(2), 2, false},
 		{"float", 1.0, 1, false},
 		{"float non-integer", 1.9, 0, true},
 		{"bad string", "P1", 0, true},
@@ -35,6 +37,16 @@ func TestParsePriority(t *testing.T) {
 				t.Fatalf("got %d want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestParsePriorityRejectsInt64OutsideNativeIntRange(t *testing.T) {
+	if strconv.IntSize != 32 {
+		t.Skip("overflow case only applies on 32-bit int platforms")
+	}
+	_, err := ParsePriority(int64(1 << 40))
+	if err == nil {
+		t.Fatalf("expected overflow error for out-of-range int64 priority")
 	}
 }
 

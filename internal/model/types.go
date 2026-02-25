@@ -44,7 +44,11 @@ func ParsePriority(v any) (int, error) {
 	case int32:
 		return normalizePriority(int(x))
 	case int64:
-		return normalizePriority(int(x))
+		n, err := intFromInt64(x)
+		if err != nil {
+			return 0, err
+		}
+		return normalizePriority(n)
 	case float64:
 		if math.IsNaN(x) || math.IsInf(x, 0) || x != math.Trunc(x) {
 			return 0, fmt.Errorf("priority must be an integer")
@@ -60,7 +64,11 @@ func ParsePriority(v any) (int, error) {
 		if err != nil {
 			return 0, fmt.Errorf("priority must be an integer")
 		}
-		return normalizePriority(int(n))
+		asInt, convErr := intFromInt64(n)
+		if convErr != nil {
+			return 0, convErr
+		}
+		return normalizePriority(asInt)
 	case string:
 		switch strings.ToUpper(strings.TrimSpace(x)) {
 		case "LOW":
@@ -77,6 +85,15 @@ func ParsePriority(v any) (int, error) {
 	default:
 		return 0, fmt.Errorf("unsupported priority type %T", v)
 	}
+}
+
+func intFromInt64(v int64) (int, error) {
+	maxInt := int64(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if v < minInt || v > maxInt {
+		return 0, fmt.Errorf("priority value out of range")
+	}
+	return int(v), nil
 }
 
 func normalizePriority(v int) (int, error) {
