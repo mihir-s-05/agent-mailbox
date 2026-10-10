@@ -128,6 +128,21 @@ func (r *Registry) LookupToken(token string) (model.Principal, bool) {
 	return principal, true
 }
 
+// PrincipalForID revalidates the original credential for background subscriptions.
+// Subject identifies the owner; token ID additionally binds revocation to a credential.
+func (r *Registry) PrincipalForID(team, subject, id string) (model.Principal, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := r.now().UTC()
+	for _, entry := range r.tokens {
+		p := entry.principal
+		if p.TeamID == team && p.Subject == subject && p.Token == id && !entry.revoked && !entry.expiresAt.IsZero() && now.Before(entry.expiresAt) {
+			return p, true
+		}
+	}
+	return model.Principal{}, false
+}
+
 func (r *Registry) lookup(token string) (model.Principal, bool, bool, bool) {
 	hash := tokens.Hash(token)
 	now := r.now().UTC()
@@ -175,6 +190,10 @@ func (r *Registry) replaceTokens(records []config.TokenRecord) {
 func FromContext(ctx context.Context) (model.Principal, bool) {
 	p, ok := ctx.Value(principalContextKey).(model.Principal)
 	return p, ok
+}
+
+func WithPrincipal(ctx context.Context, p model.Principal) context.Context {
+	return context.WithValue(ctx, principalContextKey, p)
 }
 
 func validateClientCert(cs *tls.ConnectionState) error {

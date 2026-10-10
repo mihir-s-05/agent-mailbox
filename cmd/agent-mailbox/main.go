@@ -10,143 +10,97 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
-	"github.com/mark3labs/mcp-go/server"
-
-	"github.com/mihir/msg-com/internal/auth"
+	"github.com/mihir/msg-com/internal/app"
 	"github.com/mihir/msg-com/internal/config"
-	"github.com/mihir/msg-com/internal/mcpserver"
-	"github.com/mihir/msg-com/internal/service"
-	"github.com/mihir/msg-com/internal/store"
+	"github.com/mihir/msg-com/internal/web"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config error: %v", err)
+		log.Fatalf("config: %v", err)
 	}
-	if len(cfg.BootstrapTokenSecrets) > 0 {
-		log.Printf("generated %d bootstrap token(s); plaintext secrets written to %s", len(cfg.BootstrapTokenSecrets), cfg.BootstrapTokensFile)
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
-	st, err := store.Connect(ctx, cfg.DatabaseURL)
+	runtime, err := app.Start(ctx, cfg, "")
 	if err != nil {
-		log.Fatalf("db connect error: %v", err)
+		log.Fatalf("startup: %v", err)
 	}
-	defer st.Close()
-
-	migrationsDir := filepath.Join(".", "migrations")
-	if err := st.MigrateFromDir(ctx, migrationsDir); err != nil {
-		log.Fatalf("migration error: %v", err)
-	}
-
-	notifier := service.NewNotifier(st.DB)
-	svc := service.New(st.DB, cfg, notifier)
-	mcpSvc := mcpserver.NewMailboxServer(svc, auth.FromContext)
-	notifier.SetMCPServer(mcpSvc)
-	httpMCP := server.NewStreamableHTTPServer(
-		mcpSvc,
-		server.WithEndpointPath(cfg.BasePath),
-		server.WithStateLess(true),
-	)
-	authRegistry := auth.NewRegistry(cfg)
-	authRegistry.Start(ctx)
-
+	defer runtime.Close()
+	protocol := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return runtime.Mailbox.MCP }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 512 * 1024, PropagateRequestCancellation: true})
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		w.Write([]byte(`{"ok":true}`))
 	}))
-	mux.Handle(cfg.BasePath, authRegistry.Middleware(httpMCP))
+	mux.Handle("/readyz", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		check, cancel := context.WithTimeout(req.Context(), time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		if runtime.Store.DB.Ping(check) != nil || !runtime.Events.Healthy() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"ready":false}`))
+			return
+		}
+		w.Write([]byte(`{"ready":true}`))
+	}))
+	protected := runtime.Auth.Middleware(http.NewCrossOriginProtection().Handler(protocol))
+	mux.Handle(cfg.BasePath, protected)
 	if cfg.BasePath != "/" {
-		mux.Handle(cfg.BasePath+"/", authRegistry.Middleware(httpMCP))
+		mux.Handle(cfg.BasePath+"/", protected)
 	}
-
-	httpSrv := &http.Server{
-		Addr:              cfg.Address,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	if cfg.RequireMTLS {
-		tlsCfg, err := buildTLSConfig(cfg)
+	browser := web.New(runtime.Mailbox.API, runtime.Service, runtime.Events, runtime.Auth.PrincipalForID)
+	mux.Handle("/api/", runtime.Auth.Middleware(http.NewCrossOriginProtection().Handler(browser)))
+	mux.Handle("/", web.Assets())
+	srv := &http.Server{Addr: cfg.Address, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 * 1024}
+	if cfg.UseTLS {
+		srv.TLSConfig, err = buildTLSConfig(cfg)
 		if err != nil {
-			log.Fatalf("tls config error: %v", err)
+			log.Fatalf("TLS: %v", err)
 		}
-		httpSrv.TLSConfig = tlsCfg
 	}
-
-	go notifier.Run(ctx)
-
-	go runTicker(ctx, cfg.InactivitySweepEvery, func(ctx context.Context) {
-		if err := svc.SweepInactivity(ctx); err != nil {
-			log.Printf("inactivity sweep error: %v", err)
-		}
-	})
-	go runTicker(ctx, cfg.ExpirySweepInterval, func(ctx context.Context) {
-		if err := svc.SweepExpiry(ctx); err != nil {
-			log.Printf("expiry sweep error: %v", err)
-		}
-	})
-	go runTicker(ctx, cfg.RetentionSweepInterval, func(ctx context.Context) {
-		if err := svc.SweepRetention(ctx); err != nil {
-			log.Printf("retention sweep error: %v", err)
-		}
-	})
-
 	go func() {
+		scheme := "http"
+		if cfg.UseTLS {
+			scheme = "https"
+		}
+		log.Printf("agent-mailbox listening on %s://%s%s", scheme, cfg.Address, cfg.BasePath)
 		var err error
-		if cfg.RequireMTLS {
-			log.Printf("agent-mailbox listening with mTLS on https://127.0.0.1%s%s", cfg.Address, cfg.BasePath)
-			err = httpSrv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if cfg.UseTLS {
+			err = srv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
 		} else {
-			log.Printf("agent-mailbox listening on http://127.0.0.1%s%s", cfg.Address, cfg.BasePath)
-			err = httpSrv.ListenAndServe()
+			err = srv.ListenAndServe()
 		}
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server error: %v", err)
+			log.Printf("server: %v", err)
+			cancel()
 		}
 	}()
-
 	<-ctx.Done()
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
-}
-
-func runTicker(ctx context.Context, every time.Duration, fn func(context.Context)) {
-	if every <= 0 {
-		return
-	}
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			fn(ctx)
-		}
+	shutdown, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	if err := srv.Shutdown(shutdown); err != nil {
+		srv.Close()
 	}
 }
-
 func buildTLSConfig(cfg config.Config) (*tls.Config, error) {
-	caPEM, err := os.ReadFile(cfg.TLSClientCAFile)
+	result := &tls.Config{MinVersion: tls.VersionTLS13}
+	if !cfg.RequireMTLS {
+		return result, nil
+	}
+	ca, err := os.ReadFile(cfg.TLSClientCAFile)
 	if err != nil {
 		return nil, fmt.Errorf("read client CA: %w", err)
 	}
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("failed to parse client CA")
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("invalid client CA")
 	}
-	return &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs:  pool,
-	}, nil
+	result.ClientAuth = tls.RequireAndVerifyClientCert
+	result.ClientCAs = pool
+	return result, nil
 }

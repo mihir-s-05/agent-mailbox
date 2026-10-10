@@ -24,9 +24,9 @@ const (
 )
 
 type APIError struct {
-	Code    string
-	Message string
-	Details map[string]any
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
 func (e *APIError) Error() string {

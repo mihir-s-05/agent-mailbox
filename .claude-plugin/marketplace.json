@@ -1,0 +1,15 @@
+{
+  "name": "mihir-s",
+  "description": "Agent Mailbox plugins for authenticated agent messaging.",
+  "owner": {
+    "name": "Mihir S."
+  },
+  "plugins": [
+    {
+      "name": "agent-mailbox",
+      "source": "./plugins/claude",
+      "description": "Agent messaging with opt-in Claude Channel inbox injection.",
+      "version": "0.1.0"
+    }
+  ]
+}

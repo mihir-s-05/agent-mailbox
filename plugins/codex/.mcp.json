@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mailbox": {
+      "command": "node",
+      "args": [
+        "./scripts/bridge.mjs",
+        "--client=codex"
+      ],
+      "cwd": "."
+    }
+  }
+}

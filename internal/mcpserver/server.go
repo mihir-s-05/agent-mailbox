@@ -3,454 +3,419 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strconv"
+	"net/url"
 	"strings"
-
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	"sync"
+	"time"
 
 	"github.com/mihir/msg-com/internal/auth"
+	"github.com/mihir/msg-com/internal/events"
+	"github.com/mihir/msg-com/internal/mailboxapi"
 	"github.com/mihir/msg-com/internal/model"
 	"github.com/mihir/msg-com/internal/service"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type PrincipalResolver func(context.Context) (model.Principal, bool)
-
-func NewMailboxServer(svc *service.Service, resolver PrincipalResolver) *server.MCPServer {
-	s := server.NewMCPServer("agent-mailbox", "1.0.0",
-		server.WithToolCapabilities(true),
-		server.WithResourceCapabilities(true, true),
-	)
-
-	s.AddTool(newRegisterTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.RegisterInput{
-			TeamID:                 asString(req.GetArguments()["team_id"]),
-			AgentID:                asString(req.GetArguments()["agent_id"]),
-			DisplayName:            asString(req.GetArguments()["display_name"]),
-			Tags:                   asStringSlice(req.GetArguments()["tags"]),
-			Capabilities:           asStringSlice(req.GetArguments()["capabilities"]),
-			ReplaceExistingSession: asBool(req.GetArguments()["replace_existing_session"], false),
-		}
-		return svc.RegisterAgent(ctx, p, in)
-	}))
-
-	s.AddTool(newSendTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.SendInput{
-			SessionID:      asString(req.GetArguments()["session_id"]),
-			TeamID:         asString(req.GetArguments()["team_id"]),
-			To:             asMap(req.GetArguments()["to"]),
-			Priority:       req.GetArguments()["priority"],
-			Topic:          asString(req.GetArguments()["topic"]),
-			Body:           asString(req.GetArguments()["body"]),
-			InReplyTo:      asString(req.GetArguments()["in_reply_to"]),
-			Attachments:    asMapSlice(req.GetArguments()["attachments"]),
-			TTLSeconds:     asInt(req.GetArguments()["ttl_seconds"], 0),
-			RequireAck:     asBool(req.GetArguments()["require_ack"], true),
-			ReadReceipt:    asString(req.GetArguments()["read_receipt"]),
-			IncludeSelf:    asBool(req.GetArguments()["include_self"], false),
-			IdempotencyKey: asString(req.GetArguments()["idempotency_key"]),
-		}
-		return svc.SendMessage(ctx, p, in)
-	}))
-
-	s.AddTool(newPollTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.PollInput{
-			SessionID:   asString(req.GetArguments()["session_id"]),
-			TeamID:      asString(req.GetArguments()["team_id"]),
-			MaxMessages: asInt(req.GetArguments()["max_messages"], 20),
-			MinPriority: req.GetArguments()["min_priority"],
-			WaitMS:      asInt(req.GetArguments()["wait_ms"], 0),
-			Cursor:      asString(req.GetArguments()["cursor"]),
-		}
-		return svc.PollInbox(ctx, p, in)
-	}))
-
-	s.AddTool(newAckTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.AckInput{
-			SessionID:  asString(req.GetArguments()["session_id"]),
-			TeamID:     asString(req.GetArguments()["team_id"]),
-			MessageIDs: asStringSlice(req.GetArguments()["message_ids"]),
-			AckKind:    asString(req.GetArguments()["ack_kind"]),
-		}
-		return svc.AckMessages(ctx, p, in)
-	}))
-
-	s.AddTool(newListAgentsTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.ListAgentsInput{
-			SessionID:      asString(req.GetArguments()["session_id"]),
-			TeamID:         asString(req.GetArguments()["team_id"]),
-			FilterTag:      asString(req.GetArguments()["filter_tag"]),
-			IncludeOffline: asBool(req.GetArguments()["include_offline"], false),
-		}
-		return svc.ListAgents(ctx, p, in)
-	}))
-
-	s.AddTool(newDeregisterTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.DeregisterInput{
-			SessionID: asString(req.GetArguments()["session_id"]),
-			TeamID:    asString(req.GetArguments()["team_id"]),
-			Reason:    asString(req.GetArguments()["reason"]),
-		}
-		return svc.DeregisterAgent(ctx, p, in)
-	}))
-
-	s.AddTool(newCancelTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.CancelInput{
-			SessionID: asString(req.GetArguments()["session_id"]),
-			MessageID: asString(req.GetArguments()["message_id"]),
-		}
-		return svc.CancelMessage(ctx, p, in)
-	}))
-
-	s.AddTool(newSetStatusTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.StatusInput{
-			SessionID: asString(req.GetArguments()["session_id"]),
-			Status:    asString(req.GetArguments()["status"]),
-			Note:      asString(req.GetArguments()["note"]),
-		}
-		return svc.SetAgentStatus(ctx, p, in)
-	}))
-
-	s.AddTool(newLogTool(), withEnvelope(resolver, func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError) {
-		in := service.LogInput{
-			SessionID: asString(req.GetArguments()["session_id"]),
-			Since:     asString(req.GetArguments()["since"]),
-			Limit:     asInt(req.GetArguments()["limit"], 100),
-			InReplyTo: asString(req.GetArguments()["in_reply_to"]),
-		}
-		return svc.GetMessageLog(ctx, p, in)
-	}))
-
-	s.AddResourceTemplate(
-		mcp.NewResourceTemplate(
-			"mailbox://inbox/{session_id}",
-			"Agent Inbox",
-			mcp.WithTemplateDescription("Pending messages in the agent's mailbox (read-only, no state changes)."),
-			mcp.WithTemplateMIMEType("application/json"),
-		),
-		inboxResourceHandler(svc, resolver, 0),
-	)
-	s.AddResourceTemplate(
-		mcp.NewResourceTemplate(
-			"mailbox://inbox/{session_id}/urgent",
-			"Urgent Inbox",
-			mcp.WithTemplateDescription("Only urgent (priority=3) pending messages."),
-			mcp.WithTemplateMIMEType("application/json"),
-		),
-		inboxResourceHandler(svc, resolver, 3),
-	)
-
-	return s
+type Server struct {
+	MCP      *mcp.Server
+	API      *mailboxapi.API
+	svc      *service.Service
+	resolver PrincipalResolver
+	events   *events.Service
+	validate events.PrincipalFunc
+	bearer   func(string) (model.Principal, bool)
+	mu       sync.Mutex
+	watches  map[string]map[*mcp.ServerSession]watch
+}
+type watch struct {
+	principal model.Principal
+	agent     string
+	revision  int64
+	seen      bool
+	urgent    bool
 }
 
-func inboxResourceHandler(svc *service.Service, resolver PrincipalResolver, minPriority int) server.ResourceTemplateHandlerFunc {
-	return func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		sessionID := extractSessionID(req.Params.URI)
-		if sessionID == "" {
-			return nil, fmt.Errorf("missing session_id in resource URI")
-		}
-
-		var (
-			p  model.Principal
-			ok bool
-		)
-		if resolver != nil {
-			p, ok = resolver(ctx)
-		}
+func NewMailboxServer(svc *service.Service, resolver PrincipalResolver, eventService *events.Service) *Server {
+	wrapper := &Server{svc: svc, resolver: resolver, events: eventService, API: mailboxapi.New(svc), watches: map[string]map[*mcp.ServerSession]watch{}}
+	resolve := wrapper.principal
+	subscribe := func(ctx context.Context, req *mcp.SubscribeRequest) error {
+		p, ok := resolve(ctx)
 		if !ok {
-			p, ok = auth.FromContext(ctx)
+			return fmt.Errorf("unauthenticated")
 		}
-		if !ok {
-			return nil, fmt.Errorf("unauthenticated")
+		agent, urgent, err := wrapper.authorizeURI(ctx, p, req.Params.URI)
+		if err != nil {
+			return err
 		}
-
-		messages, apiErr := svc.PeekInbox(ctx, p, sessionID, minPriority)
-		if apiErr != nil {
-			return nil, fmt.Errorf("%s: %s", apiErr.Code, apiErr.Message)
+		wrapper.mu.Lock()
+		if wrapper.watches[req.Params.URI] == nil {
+			wrapper.watches[req.Params.URI] = map[*mcp.ServerSession]watch{}
 		}
-
-		data, _ := json.Marshal(map[string]any{
-			"messages": messages,
-			"count":    len(messages),
+		wrapper.watches[req.Params.URI][req.Session] = watch{principal: p, agent: agent, urgent: urgent}
+		wrapper.mu.Unlock()
+		return nil
+	}
+	server := mcp.NewServer(&mcp.Implementation{Name: "agent-mailbox", Version: "2.0.0"}, &mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Resources: &mcp.ResourceCapabilities{Subscribe: true}}, SubscribeHandler: subscribe, UnsubscribeHandler: func(_ context.Context, req *mcp.UnsubscribeRequest) error {
+		wrapper.mu.Lock()
+		defer wrapper.mu.Unlock()
+		delete(wrapper.watches[req.Params.URI], req.Session)
+		if len(wrapper.watches[req.Params.URI]) == 0 {
+			delete(wrapper.watches, req.Params.URI)
+		}
+		return nil
+	}})
+	wrapper.MCP = server
+	for _, definition := range wrapper.API.Definitions() {
+		server.AddTool(&mcp.Tool{Name: definition.Name, Description: definition.Description, InputSchema: definition.InputSchema, OutputSchema: map[string]any{"type": "object"}, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: definition.ReadOnly}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			p, ok := resolve(ctx)
+			if !ok {
+				return toolResult(nil, model.NewError("AUTH_INVALID", "unauthenticated", nil)), nil
+			}
+			out, err := wrapper.API.Call(ctx, p, req.Params.Name, req.Params.Arguments)
+			return toolResult(out, err), nil
 		})
-		return []mcp.ResourceContents{
-			mcp.TextResourceContents{
-				URI:      req.Params.URI,
-				MIMEType: "application/json",
-				Text:     string(data),
-			},
-		}, nil
 	}
-}
-
-func extractSessionID(uri string) string {
-	const prefix = "mailbox://inbox/"
-	if !strings.HasPrefix(uri, prefix) {
-		return ""
+	for _, template := range []string{"mailbox://inbox/{session_id}", "mailbox://inbox/{session_id}/urgent", "mailbox://teams/{team_id}/agents/{agent_id}/inbox", "mailbox://teams/{team_id}/agents/{agent_id}/inbox/urgent"} {
+		server.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: template, Name: "Agent Inbox", Description: "Read outstanding mailbox messages without changing delivery state.", MIMEType: "application/json"}, func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			p, ok := resolve(ctx)
+			if !ok {
+				return nil, fmt.Errorf("unauthenticated")
+			}
+			agent, urgent, err := wrapper.authorizeURI(ctx, p, req.Params.URI)
+			if err != nil {
+				return nil, err
+			}
+			minimum := 0
+			if urgent {
+				minimum = 3
+			}
+			messages, aerr := svc.PeekMailbox(ctx, p, agent, minimum)
+			if aerr != nil {
+				return nil, aerr
+			}
+			data, _ := json.Marshal(map[string]any{"messages": messages, "count": len(messages)})
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, MIMEType: "application/json", Text: string(data)}}}, nil
+		})
 	}
-	rest := strings.TrimPrefix(uri, prefix)
-	rest = strings.TrimSuffix(rest, "/urgent")
-	rest = strings.TrimSpace(rest)
-	if rest == "" || strings.Contains(rest, "/") {
-		return ""
+	if eventService != nil {
+		wrapper.registerEvents()
 	}
-	return rest
-}
-
-type toolFn func(ctx context.Context, req mcp.CallToolRequest, p model.Principal) (map[string]any, *model.APIError)
-
-func withEnvelope(resolver PrincipalResolver, fn toolFn) server.ToolHandlerFunc {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		var (
-			p  model.Principal
-			ok bool
-		)
-		if resolver != nil {
-			p, ok = resolver(ctx)
+	// Authenticate every RPC. The SDK passes HTTP request headers in RequestExtra,
+	// allowing callers to install a credential resolver without transport sessions.
+	server.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			p, ok := resolve(ctx)
+			if extra := req.GetExtra(); extra != nil && extra.Header != nil && wrapper.bearer != nil {
+				raw := strings.TrimSpace(extra.Header.Get("Authorization"))
+				ok = false
+				if len(raw) > 7 && strings.EqualFold(raw[:7], "Bearer ") {
+					p, ok = wrapper.bearer(strings.TrimSpace(raw[7:]))
+				}
+			}
+			if !ok {
+				return nil, &jsonrpc.Error{Code: -32001, Message: "unauthenticated"}
+			}
+			ctx = auth.WithPrincipal(ctx, p)
+			if method == "subscriptions/listen" {
+				params, valid := req.GetParams().(*mcp.SubscriptionsListenParams)
+				if !valid || params.Notifications == nil {
+					return nil, &jsonrpc.Error{Code: -32602, Message: "notifications are required"}
+				}
+				for _, uri := range params.Notifications.ResourceSubscriptions {
+					if _, _, err := wrapper.authorizeURI(ctx, p, uri); err != nil {
+						return nil, err
+					}
+				}
+				stream, cancel := context.WithCancel(ctx)
+				defer cancel()
+				go wrapper.guardStream(stream, cancel, p, params.Notifications.ResourceSubscriptions)
+				ctx = stream
+			}
+			result, err := next(ctx, method, req)
+			if err == nil && method == "server/discover" && eventService != nil {
+				if discovery, ok := result.(*mcp.DiscoverResult); ok {
+					return &discoveryResult{DiscoverResult: discovery}, nil
+				}
+			}
+			return result, err
 		}
-		if !ok {
-			p, ok = auth.FromContext(ctx)
+	})
+	// The SDK fans out by URI. Check each subscriber at the sending boundary,
+	// including ownership transfers and credential revocation after subscription.
+	server.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method == "notifications/resources/updated" {
+				params, ok := req.GetParams().(*mcp.ResourceUpdatedNotificationParams)
+				if !ok {
+					return nil, nil
+				}
+				session, ok := req.GetSession().(*mcp.ServerSession)
+				if !ok {
+					return nil, nil
+				}
+				wrapper.mu.Lock()
+				w, ok := wrapper.watches[params.URI][session]
+				wrapper.mu.Unlock()
+				if !ok {
+					return nil, nil
+				}
+				p, ok := wrapper.current(w.principal)
+				if !ok {
+					return nil, nil
+				}
+				if _, _, err := wrapper.authorizeURI(ctx, p, params.URI); err != nil {
+					return nil, nil
+				}
+			}
+			return next(ctx, method, req)
 		}
-		if !ok {
-			return toolError(model.NewError("SESSION_INVALID", "request is missing authenticated principal", nil)), nil
+	})
+	return wrapper
+}
+func (s *Server) principal(ctx context.Context) (model.Principal, bool) {
+	if p, ok := auth.FromContext(ctx); ok {
+		return s.current(p)
+	}
+	if s.resolver != nil {
+		if p, ok := s.resolver(ctx); ok {
+			return s.current(p)
 		}
-		out, err := fn(ctx, req, p)
-		if err != nil {
-			return toolError(err), nil
-		}
-		result := mcp.NewToolResultStructured(out, "ok")
-		return result, nil
 	}
+	return auth.FromContext(ctx)
 }
-
-func toolError(err *model.APIError) *mcp.CallToolResult {
-	envelope := map[string]any{
-		"error": map[string]any{
-			"code":    err.Code,
-			"message": err.Message,
-			"details": err.Details,
-		},
+func (s *Server) SetPrincipalValidator(validate events.PrincipalFunc)            { s.validate = validate }
+func (s *Server) SetBearerResolver(resolve func(string) (model.Principal, bool)) { s.bearer = resolve }
+func (s *Server) current(p model.Principal) (model.Principal, bool) {
+	if s.validate != nil {
+		return s.validate(p.TeamID, p.Subject, p.Token)
 	}
-	result := mcp.NewToolResultStructured(envelope, fmt.Sprintf("%s: %s", err.Code, err.Message))
-	result.IsError = true
-	return result
+	return p, p.TeamID != "" && p.Subject != ""
 }
-
-func newRegisterTool() mcp.Tool {
-	return mcp.NewTool("register_agent",
-		mcp.WithDescription("Register or reclaim an agent mailbox session."),
-		mcp.WithString("team_id", mcp.Required(), mcp.Description("Team namespace")),
-		mcp.WithString("agent_id", mcp.Required(), mcp.Description("Stable agent id")),
-		mcp.WithString("display_name", mcp.Description("Optional human-readable name")),
-		mcp.WithArray("tags", mcp.Description("Optional tags"), mcp.WithStringItems()),
-		mcp.WithArray("capabilities", mcp.Description("Optional free-form capabilities"), mcp.WithStringItems()),
-		mcp.WithBoolean("replace_existing_session", mcp.Description("Invalidate active session if present")),
-	)
-}
-
-func newSendTool() mcp.Tool {
-	return mcp.NewTool("send_message",
-		mcp.WithDescription("Send a direct or broadcast message."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("team_id", mcp.Description("Optional explicit team consistency check")),
-		mcp.WithObject("to", mcp.Required(), mcp.Description("Routing object: direct or broadcast")),
-		mcp.WithAny("priority", mcp.Required(), mcp.Description("0-3 or LOW|NORMAL|HIGH|URGENT")),
-		mcp.WithString("topic", mcp.Required()),
-		mcp.WithString("body", mcp.Required()),
-		mcp.WithString("in_reply_to"),
-		mcp.WithArray("attachments"),
-		mcp.WithNumber("ttl_seconds"),
-		mcp.WithBoolean("require_ack"),
-		mcp.WithString("read_receipt"),
-		mcp.WithBoolean("include_self"),
-		mcp.WithString("idempotency_key"),
-	)
-}
-
-func newPollTool() mcp.Tool {
-	return mcp.NewTool("poll_inbox",
-		mcp.WithDescription("Poll inbox with keyset cursor and optional long-poll."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("team_id"),
-		mcp.WithNumber("max_messages"),
-		mcp.WithAny("min_priority"),
-		mcp.WithNumber("wait_ms"),
-		mcp.WithString("cursor"),
-	)
-}
-
-func newAckTool() mcp.Tool {
-	return mcp.NewTool("ack_messages",
-		mcp.WithDescription("Acknowledge one or more delivered messages."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("team_id"),
-		mcp.WithArray("message_ids", mcp.Required(), mcp.WithStringItems()),
-		mcp.WithString("ack_kind"),
-	)
-}
-
-func newListAgentsTool() mcp.Tool {
-	return mcp.NewTool("list_agents",
-		mcp.WithDescription("List online or all agents in the team."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("team_id"),
-		mcp.WithString("filter_tag"),
-		mcp.WithBoolean("include_offline"),
-	)
-}
-
-func newDeregisterTool() mcp.Tool {
-	return mcp.NewTool("deregister_agent",
-		mcp.WithDescription("Mark agent offline and invalidate session."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("team_id"),
-		mcp.WithString("reason"),
-	)
-}
-
-func newCancelTool() mcp.Tool {
-	return mcp.NewTool("cancel_message",
-		mcp.WithDescription("Cancel unacked deliveries for a message sent by this session."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("message_id", mcp.Required()),
-	)
-}
-
-func newSetStatusTool() mcp.Tool {
-	return mcp.NewTool("set_agent_status",
-		mcp.WithDescription("Set lightweight status: idle|busy|blocked."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("status", mcp.Required()),
-		mcp.WithString("note"),
-	)
-}
-
-func newLogTool() mcp.Tool {
-	return mcp.NewTool("get_message_log",
-		mcp.WithDescription("Read message event log for auditing/debugging."),
-		mcp.WithString("session_id", mcp.Required()),
-		mcp.WithString("since"),
-		mcp.WithNumber("limit"),
-		mcp.WithString("in_reply_to"),
-	)
-}
-
-func asMap(v any) map[string]any {
-	if v == nil {
-		return map[string]any{}
-	}
-	if m, ok := v.(map[string]any); ok {
-		return m
-	}
-	b, _ := json.Marshal(v)
-	out := map[string]any{}
-	_ = json.Unmarshal(b, &out)
-	return out
-}
-
-func asMapSlice(v any) []map[string]any {
-	if v == nil {
-		return nil
-	}
-	if raw, ok := v.([]any); ok {
-		out := make([]map[string]any, 0, len(raw))
-		for _, item := range raw {
-			out = append(out, asMap(item))
-		}
-		return out
-	}
-	b, _ := json.Marshal(v)
-	var out []map[string]any
-	_ = json.Unmarshal(b, &out)
-	return out
-}
-
-func asString(v any) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case nil:
-		return ""
-	default:
-		return fmt.Sprintf("%v", x)
-	}
-}
-
-func asStringSlice(v any) []string {
-	if v == nil {
-		return nil
-	}
-	if arr, ok := v.([]any); ok {
-		out := make([]string, 0, len(arr))
-		for _, item := range arr {
-			s := strings.TrimSpace(asString(item))
-			if s != "" {
-				out = append(out, s)
+func (s *Server) guardStream(ctx context.Context, cancel context.CancelFunc, p model.Principal, uris []string) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current, ok := s.current(p)
+			if !ok {
+				cancel()
+				return
+			}
+			for _, uri := range uris {
+				if _, _, err := s.authorizeURI(ctx, current, uri); err != nil {
+					cancel()
+					return
+				}
 			}
 		}
-		return out
 	}
-	if arr, ok := v.([]string); ok {
-		out := make([]string, 0, len(arr))
-		for _, s := range arr {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				out = append(out, s)
+}
+func toolResult(out map[string]any, err *model.APIError) *mcp.CallToolResult {
+	if err != nil {
+		out = map[string]any{"error": map[string]any{"code": err.Code, "message": err.Message, "details": err.Details}}
+	}
+	data, _ := json.Marshal(out)
+	return &mcp.CallToolResult{IsError: err != nil, StructuredContent: out, Content: []mcp.Content{&mcp.TextContent{Text: string(data)}}}
+}
+func StableURI(team, agent string) string {
+	return "mailbox://teams/" + url.PathEscape(team) + "/agents/" + url.PathEscape(agent) + "/inbox"
+}
+func (s *Server) authorizeURI(ctx context.Context, p model.Principal, raw string) (string, bool, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "mailbox" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", false, fmt.Errorf("invalid mailbox URI")
+	}
+	parts := strings.Split(strings.Trim(u.EscapedPath(), "/"), "/")
+	urgent := false
+	if len(parts) > 0 && parts[len(parts)-1] == "urgent" {
+		urgent = true
+		parts = parts[:len(parts)-1]
+	}
+	if u.Host == "inbox" && len(parts) == 1 {
+		id, err := url.PathUnescape(parts[0])
+		if err != nil {
+			return "", false, err
+		}
+		agent, aerr := s.svc.AuthorizedSession(ctx, p, id)
+		if aerr != nil {
+			return "", false, aerr
+		}
+		if aerr = s.svc.AuthorizeMailbox(ctx, p, agent); aerr != nil {
+			return "", false, aerr
+		}
+		return agent, urgent, nil
+	}
+	if u.Host != "teams" || len(parts) != 4 || parts[1] != "agents" || parts[3] != "inbox" {
+		return "", false, fmt.Errorf("invalid mailbox URI")
+	}
+	team, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", false, err
+	}
+	agent, err := url.PathUnescape(parts[2])
+	if err != nil {
+		return "", false, err
+	}
+	if team != p.TeamID {
+		return "", false, fmt.Errorf("mailbox team mismatch")
+	}
+	if err := s.svc.AuthorizeMailbox(ctx, p, agent); err != nil {
+		return "", false, err
+	}
+	return agent, urgent, nil
+}
+
+// Resource subscriptions are transient; periodic revision reconciliation also
+// repairs missed LISTEN notifications across separate server processes.
+func (s *Server) RunResourceNotifications(ctx context.Context, validate func(string, string, string) (model.Principal, bool)) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		live := map[*mcp.ServerSession]bool{}
+		for session := range s.MCP.Sessions() {
+			live[session] = true
+		}
+		s.mu.Lock()
+		snapshot := make(map[string]map[*mcp.ServerSession]watch, len(s.watches))
+		for uri, subscribers := range s.watches {
+			snapshot[uri] = map[*mcp.ServerSession]watch{}
+			for session, w := range subscribers {
+				if !live[session] {
+					delete(subscribers, session)
+					continue
+				}
+				snapshot[uri][session] = w
+			}
+			if len(subscribers) == 0 {
+				delete(s.watches, uri)
 			}
 		}
-		return out
+		s.mu.Unlock()
+		for uri, subscribers := range snapshot {
+			for session, w := range subscribers {
+				p, ok := validate(w.principal.TeamID, w.principal.Subject, w.principal.Token)
+				if !ok || s.svc.AuthorizeMailbox(ctx, p, w.agent) != nil {
+					continue
+				}
+				revision, err := s.svc.InboxRevision(ctx, p, w.agent)
+				if err != nil {
+					continue
+				}
+				if !w.seen || revision != w.revision {
+					if err = s.MCP.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: uri}); err == nil {
+						s.mu.Lock()
+						latest, exists := s.watches[uri][session]
+						latest.revision = revision
+						latest.seen = true
+						if exists {
+							s.watches[uri][session] = latest
+						}
+						s.mu.Unlock()
+					}
+				}
+			}
+		}
 	}
-	return nil
 }
 
-func asBool(v any, fallback bool) bool {
-	if v == nil {
-		return fallback
-	}
-	switch x := v.(type) {
-	case bool:
-		return x
-	case string:
-		switch strings.ToLower(strings.TrimSpace(x)) {
-		case "true", "1", "yes", "on":
-			return true
-		case "false", "0", "no", "off":
-			return false
-		default:
-			return fallback
-		}
-	case float64:
-		return x != 0
-	default:
-		return fallback
-	}
+type eventParams struct {
+	mcp.ParamsBase
+	Name      string          `json:"name,omitempty"`
+	Arguments map[string]any  `json:"arguments,omitempty"`
+	Delivery  events.Delivery `json:"delivery,omitempty"`
+	Cursor    *string         `json:"cursor,omitempty"`
+	TTLMS     json.RawMessage `json:"ttlMs,omitempty"`
+}
+type wireResult struct {
+	mcp.ResultBase
+	Data map[string]any
 }
 
-func asInt(v any, fallback int) int {
-	if v == nil {
-		return fallback
+// Preserve the SDK's result metadata, completeness and cache fields while adding
+// the Events extension, which is not yet a field on ServerCapabilities.
+type discoveryResult struct{ *mcp.DiscoverResult }
+
+func (r *discoveryResult) MarshalJSON() ([]byte, error) {
+	raw, err := json.Marshal(r.DiscoverResult)
+	if err != nil {
+		return nil, err
 	}
-	switch x := v.(type) {
-	case int:
-		return x
-	case int64:
-		return int(x)
-	case float64:
-		return int(x)
-	case json.Number:
-		n, err := x.Int64()
-		if err != nil {
-			return fallback
-		}
-		return int(n)
-	case string:
-		n, err := strconv.Atoi(strings.TrimSpace(x))
-		if err != nil {
-			return fallback
-		}
-		return n
-	default:
-		return fallback
+	var data map[string]any
+	if err = json.Unmarshal(raw, &data); err != nil {
+		return nil, err
 	}
+	if caps, ok := data["capabilities"].(map[string]any); ok {
+		caps["events"] = map[string]any{}
+	}
+	return json.Marshal(data)
+}
+
+func (r *wireResult) MarshalJSON() ([]byte, error) {
+	data := make(map[string]any, len(r.Data)+1)
+	for key, value := range r.Data {
+		data[key] = value
+	}
+	if meta := r.GetMeta(); len(meta) > 0 {
+		data["_meta"] = meta
+	}
+	return json.Marshal(data)
+}
+func (s *Server) registerEvents() {
+	for _, method := range []string{"events/list", "events/subscribe", "events/unsubscribe"} {
+		handler := func(ctx context.Context, _ *mcp.ServerSession, in *eventParams) (*wireResult, error) {
+			p, ok := s.principal(ctx)
+			if !ok {
+				return nil, &jsonrpc.Error{Code: -32001, Message: "unauthenticated"}
+			}
+			if in == nil {
+				in = &eventParams{}
+			}
+			if method == "events/list" {
+				if !p.HasScope("poll:self") {
+					return &wireResult{Data: map[string]any{"events": []any{}}}, nil
+				}
+				if in.Cursor != nil {
+					return nil, &jsonrpc.Error{Code: -32602, Message: "unknown event catalog cursor"}
+				}
+				return &wireResult{Data: map[string]any{"events": events.Catalog()}}, nil
+			}
+			input := events.SubscribeInput{Name: in.Name, Arguments: in.Arguments, Delivery: in.Delivery, Cursor: in.Cursor, TTLMS: in.TTLMS}
+			if method == "events/unsubscribe" {
+				if err := s.events.Unsubscribe(ctx, p, input); err != nil {
+					return nil, eventError(err)
+				}
+				return &wireResult{Data: map[string]any{}}, nil
+			}
+			result, err := s.events.Subscribe(ctx, p, input)
+			if err != nil {
+				return nil, eventError(err)
+			}
+			raw, _ := json.Marshal(result)
+			var data map[string]any
+			_ = json.Unmarshal(raw, &data)
+			return &wireResult{Data: data}, nil
+		}
+		if err := mcp.AddReceivingCustomMethod(s.MCP, method, handler); err != nil {
+			panic(err)
+		}
+	}
+}
+func eventError(err error) error {
+	var protocol *events.ProtocolError
+	if errors.As(err, &protocol) {
+		return &jsonrpc.Error{Code: protocol.Code, Message: protocol.Message, Data: json.RawMessage(fmt.Sprintf(`{"reason":%q}`, protocol.Reason))}
+	}
+	return &jsonrpc.Error{Code: -32603, Message: "event operation failed"}
 }
