@@ -63,6 +63,8 @@ type Config struct {
 	DefaultTTLSeconds      int
 	MaxTTLSeconds          int
 	RequireMTLS            bool
+	UseTLS                 bool
+	EventKeyFile           string
 	TLSCertFile            string
 	TLSKeyFile             string
 	TLSClientCAFile        string
@@ -118,6 +120,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	useTLS, err := envBoolStrict("MAILBOX_TLS_ENABLED", requireMTLS)
+	if err != nil {
+		return Config{}, err
+	}
 	autoGenerateTokens, err := envBoolStrict("MAILBOX_AUTO_GENERATE_TOKENS", true)
 	if err != nil {
 		return Config{}, err
@@ -161,7 +167,7 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Address:                envString("MAILBOX_ADDR", ":8443"),
+		Address:                envString("MAILBOX_ADDR", "127.0.0.1:8443"),
 		BasePath:               envString("MAILBOX_BASE_PATH", "/mcp"),
 		DatabaseURL:            strings.TrimSpace(os.Getenv("MAILBOX_DATABASE_URL")),
 		DefaultPollMS:          defaultPollMS,
@@ -178,6 +184,8 @@ func Load() (Config, error) {
 		DefaultTTLSeconds:      defaultTTLSeconds,
 		MaxTTLSeconds:          maxTTLSeconds,
 		RequireMTLS:            requireMTLS,
+		UseTLS:                 useTLS,
+		EventKeyFile:           envString("MAILBOX_EVENT_KEY_FILE", "events.key.local"),
 		TLSCertFile:            strings.TrimSpace(os.Getenv("MAILBOX_TLS_CERT_FILE")),
 		TLSKeyFile:             strings.TrimSpace(os.Getenv("MAILBOX_TLS_KEY_FILE")),
 		TLSClientCAFile:        strings.TrimSpace(os.Getenv("MAILBOX_TLS_CLIENT_CA_FILE")),
@@ -198,10 +206,20 @@ func Load() (Config, error) {
 	if !strings.HasPrefix(cfg.BasePath, "/") {
 		cfg.BasePath = "/" + cfg.BasePath
 	}
-	if cfg.RequireMTLS {
-		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || cfg.TLSClientCAFile == "" {
-			return Config{}, errors.New("MAILBOX_REQUIRE_MTLS=true requires MAILBOX_TLS_CERT_FILE, MAILBOX_TLS_KEY_FILE, and MAILBOX_TLS_CLIENT_CA_FILE")
+	cfg.BasePath = strings.TrimRight(cfg.BasePath, "/")
+	if cfg.BasePath == "" || cfg.BasePath == "/api" || strings.HasPrefix(cfg.BasePath, "/api/") || cfg.BasePath == "/healthz" || cfg.BasePath == "/readyz" {
+		return Config{}, errors.New("MAILBOX_BASE_PATH must not overlap browser API or health routes")
+	}
+	if cfg.RequireMTLS && !cfg.UseTLS {
+		return Config{}, errors.New("MAILBOX_REQUIRE_MTLS=true requires MAILBOX_TLS_ENABLED=true")
+	}
+	if cfg.UseTLS {
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" || (cfg.RequireMTLS && cfg.TLSClientCAFile == "") {
+			return Config{}, errors.New("TLS requires MAILBOX_TLS_CERT_FILE and MAILBOX_TLS_KEY_FILE; mTLS also requires MAILBOX_TLS_CLIENT_CA_FILE")
 		}
+	}
+	if cfg.DefaultPollMS <= 0 || cfg.InactivityThreshold <= 0 || cfg.RetentionWindow <= 0 || cfg.MaxBodyBytes <= 0 || cfg.MaxAttachments < 0 || cfg.MaxBroadcastRecipients <= 0 || cfg.MailboxCap <= 0 || cfg.RateLimitPerMinute <= 0 || cfg.DefaultTTLSeconds <= 0 || cfg.MaxTTLSeconds < cfg.DefaultTTLSeconds {
+		return Config{}, errors.New("mailbox limits and retention must be positive, with maximum TTL at least the default TTL")
 	}
 	if cfg.BootstrapTokenCount <= 0 {
 		return Config{}, errors.New("MAILBOX_BOOTSTRAP_TOKEN_COUNT must be greater than zero")
@@ -291,10 +309,10 @@ func parseInlineTokens(raw string, defaultTTL time.Duration, now time.Time) ([]T
 		if pipe := strings.LastIndex(p, "|"); pipe > 0 && pipe < len(p)-1 {
 			d, err := time.ParseDuration(strings.TrimSpace(p[pipe+1:]))
 			if err != nil {
-				return nil, fmt.Errorf("invalid MAILBOX_TOKENS ttl in %q: %w", p, err)
+				return nil, fmt.Errorf("invalid MAILBOX_TOKENS ttl in entry %d", i+1)
 			}
 			if d <= 0 {
-				return nil, fmt.Errorf("MAILBOX_TOKENS ttl must be > 0 in %q", p)
+				return nil, fmt.Errorf("MAILBOX_TOKENS ttl must be > 0 in entry %d", i+1)
 			}
 			tokenTTL = d
 			tokenSpec = strings.TrimSpace(p[:pipe])
@@ -303,13 +321,13 @@ func parseInlineTokens(raw string, defaultTTL time.Duration, now time.Time) ([]T
 		eq := strings.Index(tokenSpec, "=")
 		colon := strings.Index(tokenSpec, ":")
 		if eq <= 0 || colon <= eq {
-			return nil, fmt.Errorf("invalid MAILBOX_TOKENS entry %q", p)
+			return nil, fmt.Errorf("invalid MAILBOX_TOKENS entry %d", i+1)
 		}
 		rawToken := strings.TrimSpace(tokenSpec[:eq])
 		team := strings.TrimSpace(tokenSpec[eq+1 : colon])
 		scopeList := strings.TrimSpace(tokenSpec[colon+1:])
 		if rawToken == "" || team == "" || scopeList == "" {
-			return nil, fmt.Errorf("invalid MAILBOX_TOKENS entry %q", p)
+			return nil, fmt.Errorf("invalid MAILBOX_TOKENS entry %d", i+1)
 		}
 		scopes := []string{}
 		for _, s := range strings.Split(scopeList, ",") {
@@ -339,12 +357,17 @@ func normalizeTokenRecords(records []TokenRecord, cfg Config) ([]TokenRecord, er
 	}
 
 	seen := map[string]bool{}
+	seenIDs := map[string]bool{}
 	normalized := make([]TokenRecord, 0, len(records))
 	for i, in := range records {
 		id := strings.TrimSpace(in.ID)
 		if id == "" {
 			id = fmt.Sprintf("token-%d", i+1)
 		}
+		if seenIDs[id] {
+			return nil, fmt.Errorf("duplicate token id %q", id)
+		}
+		seenIDs[id] = true
 
 		teamID := strings.TrimSpace(in.TeamID)
 		if teamID == "" {

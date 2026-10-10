@@ -2,8 +2,6 @@ package service
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
@@ -11,250 +9,116 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
+// Notifier is an acceleration channel. Durable inbox revisions repair missed notifications.
 type Notifier struct {
-	mu           sync.Mutex
-	waiters      map[string]chan struct{}
-	teams        map[string]struct{}
-	pendingTeams map[string]struct{}
-
+	mu       sync.Mutex
+	waiters  map[string]*waiter
 	pool     *pgxpool.Pool
 	fallback atomic.Bool
-
-	mcpMu     sync.Mutex
-	mcpServer *server.MCPServer
+	publish  func(context.Context, string, string)
+}
+type waiter struct {
+	channel chan struct{}
+	users   int
 }
 
 func NewNotifier(pool *pgxpool.Pool) *Notifier {
-	n := &Notifier{
-		waiters:      make(map[string]chan struct{}),
-		teams:        make(map[string]struct{}),
-		pendingTeams: make(map[string]struct{}),
-		pool:         pool,
-	}
+	n := &Notifier{pool: pool, waiters: map[string]*waiter{}}
 	n.fallback.Store(true)
 	return n
 }
-
-func (n *Notifier) SetMCPServer(s *server.MCPServer) {
-	n.mcpMu.Lock()
-	defer n.mcpMu.Unlock()
-	n.mcpServer = s
-}
-
-func (n *Notifier) getMCPServer() *server.MCPServer {
-	n.mcpMu.Lock()
-	defer n.mcpMu.Unlock()
-	return n.mcpServer
-}
-
-func (n *Notifier) IsFallback() bool {
-	return n.fallback.Load()
-}
-
-func (n *Notifier) EnsureTeam(_ context.Context, teamID string) {
-	if teamID == "" {
-		return
-	}
+func (n *Notifier) SetPublisher(publish func(context.Context, string, string)) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if _, exists := n.teams[teamID]; exists {
-		return
-	}
-	n.teams[teamID] = struct{}{}
-	n.pendingTeams[teamID] = struct{}{}
+	n.publish = publish
 }
-
-func (n *Notifier) WaitCh(teamID, agentID string) <-chan struct{} {
-	key := teamID + "\x00" + agentID
+func (n *Notifier) IsFallback() bool                   { return n.fallback.Load() }
+func (n *Notifier) EnsureTeam(context.Context, string) {}
+func (n *Notifier) WaitCh(team, agent string) <-chan struct{} {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	ch, ok := n.waiters[key]
-	if !ok {
-		ch = make(chan struct{})
-		n.waiters[key] = ch
+	key := team + "\x00" + agent
+	w := n.waiters[key]
+	if w == nil {
+		w = &waiter{channel: make(chan struct{})}
+		n.waiters[key] = w
 	}
-	return ch
+	w.users++
+	return w.channel
 }
-
-func (n *Notifier) broadcast(teamID, agentID string) {
-	key := teamID + "\x00" + agentID
-
+func (n *Notifier) ReleaseWait(team, agent string, ch <-chan struct{}) {
 	n.mu.Lock()
-	if ch, ok := n.waiters[key]; ok {
-		close(ch)
-		n.waiters[key] = make(chan struct{})
+	defer n.mu.Unlock()
+	key := team + "\x00" + agent
+	w := n.waiters[key]
+	if w != nil && w.channel == ch {
+		w.users--
+		if w.users == 0 {
+			delete(n.waiters, key)
+		}
 	}
+}
+func (n *Notifier) changed(ctx context.Context, team, agent string) {
+	n.mu.Lock()
+	key := team + "\x00" + agent
+	if w := n.waiters[key]; w != nil {
+		close(w.channel)
+		delete(n.waiters, key)
+	}
+	publish := n.publish
 	n.mu.Unlock()
-}
-
-func (n *Notifier) SendResourceNotification(sessionID string) {
-	if mcpSrv := n.getMCPServer(); mcpSrv != nil {
-		base := "mailbox://inbox/" + sessionID
-		mcpSrv.SendNotificationToAllClients(
-			string(mcp.MethodNotificationResourceUpdated),
-			map[string]any{"uri": base},
-		)
-		mcpSrv.SendNotificationToAllClients(
-			string(mcp.MethodNotificationResourceUpdated),
-			map[string]any{"uri": base + "/urgent"},
-		)
+	if publish != nil {
+		publish(ctx, team, agent)
 	}
 }
-
 func (n *Notifier) Run(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
+	for ctx.Err() == nil {
 		n.runOnce(ctx)
-		if err := sleepCtx(ctx, 2*time.Second); err != nil {
+		if sleepCtx(ctx, 2*time.Second) != nil {
 			return
 		}
 	}
 }
-
 func (n *Notifier) runOnce(ctx context.Context) {
-	defer func() {
-		n.fallback.Store(true)
-	}()
-
+	defer n.fallback.Store(true)
 	conn, err := n.pool.Acquire(ctx)
 	if err != nil {
-		if ctx.Err() == nil {
-			log.Printf("notifier: acquire connection: %v", err)
-		}
 		return
 	}
 	defer conn.Release()
-
-	n.seedTeamsFromActiveSessions(ctx, conn)
-
-	n.mu.Lock()
-	for t := range n.teams {
-		n.pendingTeams[t] = struct{}{}
-	}
-	n.mu.Unlock()
-
-	if err := n.listenPendingTeams(ctx, conn); err != nil {
-		log.Printf("notifier: LISTEN bootstrap failed: %v", err)
+	if _, err = conn.Exec(ctx, `LISTEN mailbox_changed`); err != nil {
+		log.Printf("notifier listen: %v", err)
 		return
 	}
-
 	n.fallback.Store(false)
-	n.mu.Lock()
-	teamCount := len(n.teams)
-	n.mu.Unlock()
-	log.Printf("notifier: listening on %d team channel(s)", teamCount)
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := n.listenPendingTeams(ctx, conn); err != nil {
-			log.Printf("notifier: LISTEN update failed: %v", err)
-			return
-		}
-
-		waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		notification, err := conn.Conn().WaitForNotification(waitCtx)
+	for ctx.Err() == nil {
+		wait, cancel := context.WithTimeout(ctx, 2*time.Second)
+		event, err := conn.Conn().WaitForNotification(wait)
 		cancel()
-
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				continue
-			}
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("notifier: wait error: %v", err)
-			return
-		}
-
-		if notification != nil {
-			var payload struct {
-				TeamID  string `json:"team_id"`
-				AgentID string `json:"agent_id"`
-			}
-			if json.Unmarshal([]byte(notification.Payload), &payload) == nil && payload.TeamID != "" && payload.AgentID != "" {
-				n.broadcast(payload.TeamID, payload.AgentID)
-			}
-		}
-	}
-}
-
-func (n *Notifier) listenPendingTeams(ctx context.Context, conn *pgxpool.Conn) error {
-	n.mu.Lock()
-	if len(n.pendingTeams) == 0 {
-		n.mu.Unlock()
-		return nil
-	}
-	pending := make([]string, 0, len(n.pendingTeams))
-	for t := range n.pendingTeams {
-		pending = append(pending, t)
-	}
-	n.mu.Unlock()
-
-	for _, t := range pending {
-		ch := channelName(t)
-		if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{ch}.Sanitize()); err != nil {
-			return err
-		}
-		n.mu.Lock()
-		delete(n.pendingTeams, t)
-		n.mu.Unlock()
-	}
-	return nil
-}
-
-func (n *Notifier) seedTeamsFromActiveSessions(ctx context.Context, conn *pgxpool.Conn) {
-	rows, err := conn.Query(ctx, `SELECT DISTINCT team_id FROM sessions WHERE active=true`)
-	if err != nil {
-		log.Printf("notifier: seed teams from sessions failed: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	teams := make([]string, 0)
-	for rows.Next() {
-		var teamID string
-		if err := rows.Scan(&teamID); err != nil {
-			log.Printf("notifier: seed team scan failed: %v", err)
+		if errors.Is(err, context.DeadlineExceeded) {
 			continue
 		}
-		if teamID != "" {
-			teams = append(teams, teamID)
+		if err != nil {
+			return
+		}
+		var payload struct {
+			Team  string `json:"team_id"`
+			Agent string `json:"agent_id"`
+		}
+		if event != nil && json.Unmarshal([]byte(event.Payload), &payload) == nil && payload.Team != "" && payload.Agent != "" {
+			n.changed(ctx, payload.Team, payload.Agent)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("notifier: seed team iteration failed: %v", err)
-		return
-	}
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for _, teamID := range teams {
-		n.teams[teamID] = struct{}{}
-		n.pendingTeams[teamID] = struct{}{}
-	}
 }
-
-func channelName(teamID string) string {
-	h := sha256.Sum256([]byte(teamID))
-	return "mbx_" + hex.EncodeToString(h[:])[:58]
-}
-
+func channelName(string) string { return "mailbox_changed" }
 func sleepCtx(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
 	select {
-	case <-t.C:
+	case <-timer.C:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

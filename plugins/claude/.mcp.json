@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "mailbox": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/bridge.mjs",
+        "--client=claude",
+        "--channel"
+      ],
+      "env": {
+        "MAILBOX_URL": "${user_config.url}",
+        "MAILBOX_AGENT_ID": "${user_config.agent}",
+        "MAILBOX_TOKEN": "${user_config.token}",
+        "MAILBOX_ALLOWED_SENDERS": "${user_config.senders}"
+      }
+    }
+  }
+}

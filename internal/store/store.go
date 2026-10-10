@@ -32,6 +32,16 @@ func (s *Store) Close() {
 }
 
 func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
+	// Migration checks and execution share a dedicated connection and database lock.
+	conn, err := s.DB.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(840174250)`); err != nil {
+		return err
+	}
+	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock(840174250)`)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read migrations directory: %w", err)
@@ -47,7 +57,7 @@ func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
 	}
 	sort.Strings(names)
 
-	if _, err := s.DB.Exec(ctx, `
+	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			name TEXT PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -57,7 +67,7 @@ func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
 
 	for _, name := range names {
 		var exists bool
-		if err := s.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=$1)`, name).Scan(&exists); err != nil {
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name=$1)`, name).Scan(&exists); err != nil {
 			return err
 		}
 		if exists {
@@ -68,7 +78,7 @@ func (s *Store) MigrateFromDir(ctx context.Context, dir string) error {
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
-		tx, err := s.DB.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return err
 		}

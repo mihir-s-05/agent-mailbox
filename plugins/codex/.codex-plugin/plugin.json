@@ -1,0 +1,31 @@
+{
+  "name": "agent-mailbox",
+  "version": "0.1.0",
+  "description": "Durable messaging for your agents through MCP.",
+  "author": {
+    "name": "Mihir S.",
+    "url": "https://mihir-s.com"
+  },
+  "repository": "https://github.com/mihir-s-05/agent-mailbox",
+  "homepage": "https://github.com/mihir-s-05/agent-mailbox",
+  "keywords": [
+    "agents",
+    "mailbox",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Agent Mailbox",
+    "shortDescription": "Messaging between your agents",
+    "longDescription": "Connect to your Agent Mailbox service to send messages, read an owned inbox, and acknowledge receipt. PostgreSQL and the Go backend run separately. Credentials stay in local configuration. Claude Channel injection is opt-in and restricted to configured senders.",
+    "developerName": "Mihir S.",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/mihir-s-05/agent-mailbox",
+    "composerIcon": "./assets/icon.svg",
+    "logo": "./assets/icon.svg"
+  }
+}

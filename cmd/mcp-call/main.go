@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
 
 type requestEnvelope struct {
@@ -28,6 +29,7 @@ func main() {
 		caFile     string
 		certFile   string
 		keyFile    string
+		version    string
 	)
 
 	flag.StringVar(&url, "url", "", "MCP endpoint URL")
@@ -37,6 +39,7 @@ func main() {
 	flag.StringVar(&caFile, "ca", "", "Path to CA certificate PEM")
 	flag.StringVar(&certFile, "cert", "", "Path to client certificate PEM")
 	flag.StringVar(&keyFile, "key", "", "Path to client key PEM")
+	flag.StringVar(&version, "protocol-version", "2026-07-28", "MCP protocol version (use 2025-11-25 for legacy calls)")
 	flag.Parse()
 
 	if url == "" || token == "" || method == "" {
@@ -48,6 +51,16 @@ func main() {
 	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid --params JSON: %v\n", err)
 		os.Exit(2)
+	}
+	if version >= "2026-07-28" {
+		meta, ok := params["_meta"].(map[string]any)
+		if !ok {
+			meta = map[string]any{}
+		}
+		meta["io.modelcontextprotocol/protocolVersion"] = version
+		meta["io.modelcontextprotocol/clientInfo"] = map[string]any{"name": "mailbox-mcp-call", "version": "2.0.0"}
+		meta["io.modelcontextprotocol/clientCapabilities"] = map[string]any{}
+		params["_meta"] = meta
 	}
 
 	envelope := requestEnvelope{
@@ -62,31 +75,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := &http.Client{}
-	if caFile != "" && certFile != "" && keyFile != "" {
-		caPEM, err := os.ReadFile(caFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "read CA: %v\n", err)
-			os.Exit(1)
+	client := &http.Client{Timeout: 30 * time.Second}
+	if caFile != "" || certFile != "" || keyFile != "" {
+		clientTLS := &tls.Config{MinVersion: tls.VersionTLS13}
+		if caFile != "" {
+			caPEM, err := os.ReadFile(caFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "read CA: %v\n", err)
+				os.Exit(1)
+			}
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(caPEM) {
+				fmt.Fprintln(os.Stderr, "failed to parse CA bundle")
+				os.Exit(1)
+			}
+			clientTLS.RootCAs = caPool
 		}
-		caPool := x509.NewCertPool()
-		if !caPool.AppendCertsFromPEM(caPEM) {
-			fmt.Fprintln(os.Stderr, "failed to parse CA bundle")
-			os.Exit(1)
+		if certFile != "" || keyFile != "" {
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "load client cert/key: %v\n", err)
+				os.Exit(1)
+			}
+			clientTLS.Certificates = []tls.Certificate{cert}
 		}
-
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load client cert/key: %v\n", err)
-			os.Exit(1)
-		}
-		client.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion:   tls.VersionTLS13,
-				RootCAs:      caPool,
-				Certificates: []tls.Certificate{cert},
-			},
-		}
+		client.Transport = &http.Transport{TLSClientConfig: clientTLS}
 	}
 
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -96,6 +109,14 @@ func main() {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", version)
+	req.Header.Set("Mcp-Method", method)
+	if name, ok := params["name"].(string); ok {
+		req.Header.Set("Mcp-Name", name)
+	} else if uri, ok := params["uri"].(string); ok {
+		req.Header.Set("Mcp-Name", uri)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -1,0 +1,462 @@
+[
+  {
+    "name": "register_agent",
+    "description": "Register or resume an agent mailbox. Replacement invalidates the previous session; other owners require agents:takeover.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "capabilities": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "display_name": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "replace_existing_session": {
+          "type": "boolean"
+        },
+        "tags": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "team_id",
+        "agent_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "send_message",
+    "description": "Send a durable direct or broadcast message. Reuse idempotency_key for retries of the same content.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "attachments": {
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "body": {
+          "maxLength": 32768,
+          "type": "string"
+        },
+        "idempotency_key": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "in_reply_to": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "include_self": {
+          "type": "boolean"
+        },
+        "priority": {
+          "oneOf": [
+            {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "enum": [
+                "LOW",
+                "NORMAL",
+                "HIGH",
+                "URGENT"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "read_receipt": {
+          "enum": [
+            "NONE",
+            "ON_DELIVER",
+            "ON_ACK"
+          ],
+          "type": "string"
+        },
+        "require_ack": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "to": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "agent_id": {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                "type": {
+                  "const": "direct"
+                }
+              },
+              "required": [
+                "type",
+                "agent_id"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "const": "team"
+                },
+                "type": {
+                  "const": "broadcast"
+                }
+              },
+              "required": [
+                "type",
+                "scope"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "scope": {
+                  "const": "tag"
+                },
+                "tag": {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                "type": {
+                  "const": "broadcast"
+                }
+              },
+              "required": [
+                "type",
+                "scope",
+                "tag"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "topic": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "ttl_seconds": {
+          "maximum": 2592000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id",
+        "to",
+        "priority",
+        "topic",
+        "body"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "poll_inbox",
+    "description": "Fetch outstanding messages and record delivery. Acknowledgement records receipt, not proof of completed work. Pagination cursors apply only to one snapshot.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "max_messages": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_priority": {
+          "oneOf": [
+            {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "enum": [
+                "LOW",
+                "NORMAL",
+                "HIGH",
+                "URGENT"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "wait_ms": {
+          "maximum": 25000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "ack_messages",
+    "description": "Acknowledge up to 100 delivered messages. Duplicate acknowledgements are harmless.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ack_kind": {
+          "enum": [
+            "ACK"
+          ],
+          "type": "string"
+        },
+        "message_ids": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "message_ids"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "list_agents",
+    "description": "List team agents, optionally filtered by tag and including offline mailboxes.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "filter_tag": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "include_offline": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": true
+  },
+  {
+    "name": "deregister_agent",
+    "description": "Mark this agent offline and invalidate its session. Outstanding messages remain durable.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "cancel_message",
+    "description": "Cancel outstanding deliveries of a message sent by this agent.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "message_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "message_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "set_agent_status",
+    "description": "Set this agent's current work status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "note": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "busy",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "readOnly": false
+  },
+  {
+    "name": "get_message_log",
+    "description": "Read lifecycle events for messages sent or received by this mailbox.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "in_reply_to": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "limit": {
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "since": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": true
+  },
+  {
+    "name": "peek_inbox",
+    "description": "Read up to 20 outstanding messages without changing delivery state.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "min_priority": {
+          "maximum": 3,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "team_id": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "readOnly": true
+  }
+]

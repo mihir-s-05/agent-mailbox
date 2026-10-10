@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,86 +23,78 @@ type Service struct {
 	db       *pgxpool.Pool
 	cfg      config.Config
 	notifier *Notifier
-
-	rlMu       sync.Mutex
-	rateWindow map[string]rateState
-}
-
-type rateState struct {
-	WindowStart time.Time
-	Count       int
 }
 
 type RegisterInput struct {
-	TeamID                 string
-	AgentID                string
-	DisplayName            string
-	Tags                   []string
-	Capabilities           []string
-	ReplaceExistingSession bool
+	TeamID                 string   `json:"team_id"`
+	AgentID                string   `json:"agent_id"`
+	DisplayName            string   `json:"display_name"`
+	Tags                   []string `json:"tags"`
+	Capabilities           []string `json:"capabilities"`
+	ReplaceExistingSession bool     `json:"replace_existing_session"`
 }
 
 type SendInput struct {
-	SessionID      string
-	TeamID         string
-	To             map[string]any
-	Priority       any
-	Topic          string
-	Body           string
-	InReplyTo      string
-	Attachments    []map[string]any
-	TTLSeconds     int
-	RequireAck     bool
-	ReadReceipt    string
-	IncludeSelf    bool
-	IdempotencyKey string
+	SessionID      string           `json:"session_id"`
+	TeamID         string           `json:"team_id"`
+	To             map[string]any   `json:"to"`
+	Priority       any              `json:"priority"`
+	Topic          string           `json:"topic"`
+	Body           string           `json:"body"`
+	InReplyTo      string           `json:"in_reply_to"`
+	Attachments    []map[string]any `json:"attachments"`
+	TTLSeconds     int              `json:"ttl_seconds"`
+	RequireAck     bool             `json:"require_ack"`
+	ReadReceipt    string           `json:"read_receipt"`
+	IncludeSelf    bool             `json:"include_self"`
+	IdempotencyKey string           `json:"idempotency_key"`
 }
 
 type PollInput struct {
-	SessionID   string
-	TeamID      string
-	MaxMessages int
-	MinPriority any
-	WaitMS      int
-	Cursor      string
+	SessionID   string `json:"session_id"`
+	TeamID      string `json:"team_id"`
+	MaxMessages int    `json:"max_messages"`
+	MinPriority any    `json:"min_priority"`
+	WaitMS      int    `json:"wait_ms"`
+	Cursor      string `json:"cursor"`
 }
 
 type AckInput struct {
-	SessionID  string
-	TeamID     string
-	MessageIDs []string
-	AckKind    string
+	SessionID  string   `json:"session_id"`
+	TeamID     string   `json:"team_id"`
+	MessageIDs []string `json:"message_ids"`
+	AckKind    string   `json:"ack_kind"`
 }
 
 type ListAgentsInput struct {
-	SessionID      string
-	TeamID         string
-	FilterTag      string
-	IncludeOffline bool
+	SessionID      string `json:"session_id"`
+	TeamID         string `json:"team_id"`
+	FilterTag      string `json:"filter_tag"`
+	IncludeOffline bool   `json:"include_offline"`
 }
 
 type DeregisterInput struct {
-	SessionID string
-	TeamID    string
-	Reason    string
+	SessionID string `json:"session_id"`
+	TeamID    string `json:"team_id"`
+	Reason    string `json:"reason"`
 }
 
 type CancelInput struct {
-	SessionID string
-	MessageID string
+	SessionID string `json:"session_id"`
+	MessageID string `json:"message_id"`
 }
 
 type StatusInput struct {
-	SessionID string
-	Status    string
-	Note      string
+	SessionID string `json:"session_id"`
+	Status    string `json:"status"`
+	Note      string `json:"note"`
 }
 
 type LogInput struct {
-	SessionID string
-	Since     string
-	Limit     int
-	InReplyTo string
+	SessionID string `json:"session_id"`
+	Since     string `json:"since"`
+	Limit     int    `json:"limit"`
+	InReplyTo string `json:"in_reply_to"`
 }
 
 type sessionRow struct {
@@ -119,16 +110,21 @@ type recipient struct {
 
 func New(db *pgxpool.Pool, cfg config.Config, notifier *Notifier) *Service {
 	return &Service{
-		db:         db,
-		cfg:        cfg,
-		notifier:   notifier,
-		rateWindow: map[string]rateState{},
+		db:       db,
+		cfg:      cfg,
+		notifier: notifier,
 	}
 }
 
 func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in RegisterInput) (map[string]any, *model.APIError) {
 	in.TeamID = strings.TrimSpace(in.TeamID)
 	in.AgentID = strings.TrimSpace(in.AgentID)
+	if p.TeamID == "" || p.Subject == "" {
+		return nil, model.NewError("FORBIDDEN", "authenticated team and subject are required", nil)
+	}
+	if len(in.TeamID) > 128 || len(in.AgentID) > 128 || len(in.DisplayName) > 256 || len(in.Tags) > 32 || len(in.Capabilities) > 32 {
+		return nil, model.NewError("INVALID_INPUT", "agent metadata exceeds limits", nil)
+	}
 	if in.TeamID == "" || in.AgentID == "" {
 		return nil, model.NewError("INVALID_INPUT", "team_id and agent_id are required", nil)
 	}
@@ -147,22 +143,42 @@ func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in Regis
 	}
 	defer tx.Rollback(ctx)
 
+	var existingOwner *string
+	err = tx.QueryRow(ctx, `SELECT owner_subject FROM agents WHERE team_id=$1 AND agent_id=$2 FOR UPDATE`, in.TeamID, in.AgentID).Scan(&existingOwner)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, dbError("read agent owner", err)
+	}
+	if err == nil && (existingOwner == nil || *existingOwner != p.Subject) {
+		if !p.HasScope("agents:takeover") || !in.ReplaceExistingSession {
+			return nil, model.NewError("FORBIDDEN", "agent belongs to a different principal; explicit takeover permission and replacement are required", nil)
+		}
+	}
+	// Insert first to serialize concurrent initial registration. The conditional conflict
+	// update prevents a second principal from changing metadata when it loses the race.
 	tagsJSON, _ := json.Marshal(normalizeStringSlice(in.Tags))
 	capsJSON, _ := json.Marshal(normalizeStringSlice(in.Capabilities))
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO agents(team_id, agent_id, display_name, tags, capabilities, last_seen_at, registered_at, online)
-		VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$6,true)
+		INSERT INTO agents(team_id, agent_id, display_name, tags, capabilities, last_seen_at, registered_at, online,owner_subject)
+		VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$6,true,$7)
 		ON CONFLICT (team_id,agent_id)
 		DO UPDATE SET
 			display_name = EXCLUDED.display_name,
 			tags = EXCLUDED.tags,
 			capabilities = EXCLUDED.capabilities,
 			last_seen_at = EXCLUDED.last_seen_at,
-			online = true`,
-		in.TeamID, in.AgentID, strings.TrimSpace(in.DisplayName), string(tagsJSON), string(capsJSON), now); err != nil {
+			online = true, owner_subject=EXCLUDED.owner_subject
+		WHERE agents.owner_subject=EXCLUDED.owner_subject OR $8`,
+		in.TeamID, in.AgentID, strings.TrimSpace(in.DisplayName), string(tagsJSON), string(capsJSON), now, p.Subject, p.HasScope("agents:takeover") && in.ReplaceExistingSession); err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to upsert agent", map[string]any{"error": err.Error()})
 	}
 
+	var owner string
+	if err := tx.QueryRow(ctx, `SELECT owner_subject FROM agents WHERE team_id=$1 AND agent_id=$2`, in.TeamID, in.AgentID).Scan(&owner); err != nil {
+		return nil, dbError("verify owner", err)
+	}
+	if owner != p.Subject {
+		return nil, model.NewError("FORBIDDEN", "agent belongs to a different principal", nil)
+	}
 	var activeSessionID string
 	err = tx.QueryRow(ctx, `
 		SELECT session_id
@@ -173,9 +189,7 @@ func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in Regis
 		return nil, model.NewError("INTERNAL_ERROR", "failed to check active session", map[string]any{"error": err.Error()})
 	}
 	if activeSessionID != "" && !in.ReplaceExistingSession {
-		return nil, model.NewError("SESSION_CONFLICT", "active session exists; set replace_existing_session=true to rotate", map[string]any{
-			"session_id": activeSessionID,
-		})
+		return nil, model.NewError("SESSION_CONFLICT", "active session exists; set replace_existing_session=true to rotate", nil)
 	}
 	if activeSessionID != "" && in.ReplaceExistingSession {
 		if _, err := tx.Exec(ctx, `
@@ -223,185 +237,8 @@ func (s *Service) RegisterAgent(ctx context.Context, p model.Principal, in Regis
 	}, nil
 }
 
-func (s *Service) SendMessage(ctx context.Context, p model.Principal, in SendInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, in.TeamID)
-	if aerr != nil {
-		return nil, aerr
-	}
-	if p.TeamID != "" && p.TeamID != sess.TeamID {
-		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
-			"expected_team": p.TeamID,
-			"session_team":  sess.TeamID,
-		})
-	}
-	if !s.takeRateLimit(sess.TeamID + ":" + sess.AgentID) {
-		return nil, model.NewError("RATE_LIMITED", "sender exceeded per-minute rate limit", map[string]any{
-			"retry_after_ms": 15000,
-		})
-	}
-
-	if len(in.Body) == 0 {
-		return nil, model.NewError("INVALID_INPUT", "body is required", nil)
-	}
-	if len(in.Body) > s.cfg.MaxBodyBytes {
-		return nil, model.NewError("BODY_TOO_LARGE", "body exceeds maximum size", map[string]any{
-			"max_bytes": s.cfg.MaxBodyBytes,
-		})
-	}
-	if len(in.Attachments) > s.cfg.MaxAttachments {
-		return nil, model.NewError("INVALID_INPUT", "too many attachments", map[string]any{
-			"max_attachments": s.cfg.MaxAttachments,
-		})
-	}
-
-	priority, err := model.ParsePriority(in.Priority)
-	if err != nil {
-		return nil, model.NewError("INVALID_PRIORITY", "invalid priority", map[string]any{"error": err.Error()})
-	}
-	readReceipt, err := model.NormalizeReadReceipt(in.ReadReceipt)
-	if err != nil {
-		return nil, model.NewError("INVALID_INPUT", "invalid read_receipt", map[string]any{"error": err.Error()})
-	}
-	if in.TTLSeconds <= 0 {
-		in.TTLSeconds = s.cfg.DefaultTTLSeconds
-	}
-	if in.TTLSeconds > s.cfg.MaxTTLSeconds {
-		in.TTLSeconds = s.cfg.MaxTTLSeconds
-	}
-
-	recipients, toType, toValue, aerr := s.resolveRecipients(ctx, sess.TeamID, sess.AgentID, in.To, in.IncludeSelf)
-	if aerr != nil {
-		return nil, aerr
-	}
-	if toType == "direct" {
-		if !p.HasScope("send:any") && !p.HasScope("send:direct") {
-			return nil, model.NewError("INVALID_INPUT", "missing send:direct scope", nil)
-		}
-	} else {
-		if !p.HasScope("send:any") && !p.HasScope("send:broadcast") {
-			return nil, model.NewError("INVALID_INPUT", "missing send:broadcast scope", nil)
-		}
-	}
-	if len(recipients) > s.cfg.MaxBroadcastRecipients && toType != "direct" {
-		return nil, model.NewError("BROADCAST_TOO_WIDE", "broadcast exceeds recipient limit", map[string]any{
-			"max_recipients":     s.cfg.MaxBroadcastRecipients,
-			"matched_recipients": len(recipients),
-		})
-	}
-	if aerr := s.ensureMailboxCapacity(ctx, sess.TeamID, recipients); aerr != nil {
-		return nil, aerr
-	}
-
-	now := time.Now().UTC()
-	if in.IdempotencyKey != "" {
-		var existing string
-		var count int
-		err := s.db.QueryRow(ctx, `
-			SELECT m.message_id, COALESCE((SELECT count(*)::int FROM deliveries d WHERE d.message_id=m.message_id),0)
-			FROM messages m
-			WHERE m.team_id=$1 AND m.from_agent_id=$2 AND m.idempotency_key=$3`,
-			sess.TeamID, sess.AgentID, in.IdempotencyKey).Scan(&existing, &count)
-		if err == nil {
-			return map[string]any{
-				"message_id":      existing,
-				"accepted_at":     now.Format(time.RFC3339Nano),
-				"recipient_count": count,
-				"deduplicated":    true,
-			}, nil
-		}
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return nil, model.NewError("INTERNAL_ERROR", "idempotency lookup failed", map[string]any{"error": err.Error()})
-		}
-	}
-
-	msgID := newULID(now)
-	attJSON, _ := json.Marshal(in.Attachments)
-	expiresAt := now.Add(time.Duration(in.TTLSeconds) * time.Second)
-
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to begin transaction", map[string]any{"error": err.Error()})
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO messages(
-			message_id, team_id, from_agent_id, to_type, to_value, priority, topic, body, in_reply_to,
-			attachments, require_ack, read_receipt, idempotency_key, created_at, ttl_seconds, expires_at, cancelled
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15,$16,false)`,
-		msgID, sess.TeamID, sess.AgentID, toType, toValue, priority, strings.TrimSpace(in.Topic), in.Body,
-		nullable(in.InReplyTo), string(attJSON), in.RequireAck, readReceipt, nullable(in.IdempotencyKey), now, in.TTLSeconds, expiresAt); err != nil {
-		if in.IdempotencyKey != "" && isUniqueIdempotencyViolation(err) {
-			var existing string
-			var count int
-			lookupErr := tx.QueryRow(ctx, `
-				SELECT m.message_id, COALESCE((SELECT count(*)::int FROM deliveries d WHERE d.message_id=m.message_id),0)
-				FROM messages m
-				WHERE m.team_id=$1 AND m.from_agent_id=$2 AND m.idempotency_key=$3`,
-				sess.TeamID, sess.AgentID, in.IdempotencyKey).Scan(&existing, &count)
-			if lookupErr == nil {
-				_ = tx.Rollback(ctx)
-				return map[string]any{
-					"message_id":      existing,
-					"accepted_at":     now.Format(time.RFC3339Nano),
-					"recipient_count": count,
-					"deduplicated":    true,
-				}, nil
-			}
-		}
-		return nil, model.NewError("INTERNAL_ERROR", "failed to insert message", map[string]any{"error": err.Error()})
-	}
-
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-		VALUES($1,$2,$3,NULL,'ACCEPTED',$4,'{}'::jsonb)`,
-		uuid.NewString(), sess.TeamID, msgID, now); err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to record message event", map[string]any{"error": err.Error()})
-	}
-
-	for _, r := range recipients {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO deliveries(message_id, team_id, recipient_agent_id, state, read_receipt)
-			VALUES($1,$2,$3,'PENDING',$4)`,
-			msgID, sess.TeamID, r.AgentID, readReceipt); err != nil {
-			return nil, model.NewError("INTERNAL_ERROR", "failed to insert delivery", map[string]any{
-				"error":              err.Error(),
-				"recipient_agent_id": r.AgentID,
-			})
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to commit message", map[string]any{"error": err.Error()})
-	}
-
-	if s.notifier != nil {
-		for _, r := range recipients {
-			payload, _ := json.Marshal(map[string]string{
-				"team_id":  sess.TeamID,
-				"agent_id": r.AgentID,
-			})
-			_, _ = s.db.Exec(ctx, "SELECT pg_notify($1, $2)",
-				channelName(sess.TeamID), string(payload))
-			var sid string
-			if err := s.db.QueryRow(ctx,
-				`SELECT session_id FROM sessions WHERE team_id=$1 AND agent_id=$2 AND active=true LIMIT 1`,
-				sess.TeamID, r.AgentID).Scan(&sid); err == nil {
-				s.notifier.SendResourceNotification(sid)
-			}
-		}
-	}
-
-	return map[string]any{
-		"message_id":      msgID,
-		"accepted_at":     now.Format(time.RFC3339Nano),
-		"recipient_count": len(recipients),
-		"deduplicated":    false,
-	}, nil
-}
-
 func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, in.TeamID)
+	sess, aerr := s.requireSession(ctx, p, in.SessionID, in.TeamID)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -430,6 +267,9 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 	if waitMS < 0 {
 		waitMS = 0
 	}
+	if in.Cursor != "" {
+		waitMS = 0
+	}
 	if waitMS > 25000 {
 		waitMS = 25000
 	}
@@ -447,8 +287,13 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 		var waitCh <-chan struct{}
 		if s.notifier != nil && !s.notifier.IsFallback() {
 			waitCh = s.notifier.WaitCh(sess.TeamID, sess.AgentID)
+			defer s.notifier.ReleaseWait(sess.TeamID, sess.AgentID, waitCh)
 		}
 
+		sess, aerr = s.requireSession(ctx, p, in.SessionID, in.TeamID)
+		if aerr != nil {
+			return nil, aerr
+		}
 		rows, nextCursor, snapshotAt, aerr = s.fetchPollPage(ctx, sess, minPriority, maxMessages, in.Cursor)
 		if aerr != nil {
 			return nil, aerr
@@ -460,11 +305,14 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 			waitCtx, waitCancel := context.WithDeadline(ctx, deadline)
 			select {
 			case <-waitCh:
+			case <-time.After(time.Second):
 			case <-waitCtx.Done():
 			}
 			waitCancel()
 		} else {
-			time.Sleep(200 * time.Millisecond)
+			if err := sleepCtx(ctx, 200*time.Millisecond); err != nil {
+				return nil, model.NewError("CANCELLED", "poll cancelled", nil)
+			}
 		}
 	}
 
@@ -480,8 +328,9 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 			  AND m.priority=3
 			  AND m.expires_at > now()
 			  AND m.cancelled=false
+			  AND EXISTS(SELECT 1 FROM agents a JOIN sessions s USING(team_id,agent_id) WHERE a.team_id=$1 AND a.agent_id=$2 AND a.owner_subject=$3 AND s.session_id=$4 AND s.active)
 		)`,
-		sess.TeamID, sess.AgentID).Scan(&hasUrgent); err != nil {
+		sess.TeamID, sess.AgentID, p.Subject, sess.SessionID).Scan(&hasUrgent); err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to compute has_urgent", map[string]any{"error": err.Error()})
 	}
 
@@ -501,19 +350,18 @@ func (s *Service) PollInbox(ctx context.Context, p model.Principal, in PollInput
 }
 
 func (s *Service) PeekInbox(ctx context.Context, p model.Principal, sessionID string, minPriority int) ([]map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, sessionID, "")
+	sess, aerr := s.requireSession(ctx, p, sessionID, "")
 	if aerr != nil {
 		return nil, aerr
 	}
-	if p.TeamID != "" && p.TeamID != sess.TeamID {
-		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
-			"expected_team": p.TeamID,
-			"session_team":  sess.TeamID,
-		})
+	return s.PeekMailbox(ctx, p, sess.AgentID, minPriority)
+}
+
+func (s *Service) PeekMailbox(ctx context.Context, p model.Principal, agent string, minPriority int) ([]map[string]any, *model.APIError) {
+	if aerr := s.AuthorizeMailbox(ctx, p, agent); aerr != nil {
+		return nil, aerr
 	}
-	if !p.HasScope("*") && !p.HasScope("poll:self") {
-		return nil, model.NewError("INVALID_INPUT", "missing poll:self scope", nil)
-	}
+	sess := sessionRow{TeamID: p.TeamID, AgentID: agent}
 
 	const limit = 20
 	rows, err := s.db.Query(ctx, `
@@ -542,9 +390,10 @@ func (s *Service) PeekInbox(ctx context.Context, p model.Principal, sessionID st
 		  AND m.cancelled=false
 		  AND m.expires_at > now()
 		  AND m.priority >= $3
+		  AND EXISTS(SELECT 1 FROM agents a WHERE a.team_id=$1 AND a.agent_id=$2 AND a.owner_subject=$5)
 		ORDER BY m.priority DESC, m.created_at ASC, m.message_id ASC
 		LIMIT $4`,
-		sess.TeamID, sess.AgentID, minPriority, limit)
+		sess.TeamID, sess.AgentID, minPriority, limit, p.Subject)
 	if err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to peek inbox", map[string]any{"error": err.Error()})
 	}
@@ -600,93 +449,17 @@ func (s *Service) PeekInbox(ctx context.Context, p model.Principal, sessionID st
 			"delivered_at":   toRFC3339(deliveredAt),
 			"acked_at":       toRFC3339(ackedAt),
 			"read_receipt":   readReceipt,
+			"require_ack":    requireAck,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, dbError("iterate inbox", err)
 	}
 	return out, nil
 }
 
-func (s *Service) AckMessages(ctx context.Context, p model.Principal, in AckInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, in.TeamID)
-	if aerr != nil {
-		return nil, aerr
-	}
-	if p.TeamID != "" && p.TeamID != sess.TeamID {
-		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
-			"expected_team": p.TeamID,
-			"session_team":  sess.TeamID,
-		})
-	}
-	if strings.ToUpper(strings.TrimSpace(in.AckKind)) != "" && strings.ToUpper(strings.TrimSpace(in.AckKind)) != "ACK" {
-		return nil, model.NewError("INVALID_INPUT", "ack_kind must be ACK in v1", nil)
-	}
-	if len(in.MessageIDs) == 0 {
-		return map[string]any{"acked": []string{}, "not_found": []string{}, "already_acked": []string{}}, nil
-	}
-
-	now := time.Now().UTC()
-	acked := []string{}
-	already := []string{}
-	notFound := []string{}
-
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to begin ack transaction", map[string]any{"error": err.Error()})
-	}
-	defer tx.Rollback(ctx)
-
-	for _, id := range in.MessageIDs {
-		var state string
-		err := tx.QueryRow(ctx, `
-			SELECT state FROM deliveries
-			WHERE team_id=$1 AND recipient_agent_id=$2 AND message_id=$3`,
-			sess.TeamID, sess.AgentID, id).Scan(&state)
-		if errors.Is(err, pgx.ErrNoRows) {
-			notFound = append(notFound, id)
-			continue
-		}
-		if err != nil {
-			return nil, model.NewError("INTERNAL_ERROR", "failed to read delivery state", map[string]any{"error": err.Error()})
-		}
-
-		if state == model.DeliveryAcked {
-			already = append(already, id)
-			continue
-		}
-		if state == model.DeliveryPending {
-			notFound = append(notFound, id)
-			continue
-		}
-		if state == model.DeliveryCancelled || state == model.DeliveryExpired {
-			notFound = append(notFound, id)
-			continue
-		}
-
-		if _, err := tx.Exec(ctx, `
-			UPDATE deliveries
-			SET state='ACKED', acked_at=$1
-			WHERE team_id=$2 AND recipient_agent_id=$3 AND message_id=$4`,
-			now, sess.TeamID, sess.AgentID, id); err != nil {
-			return nil, model.NewError("INTERNAL_ERROR", "failed to ack message", map[string]any{"error": err.Error()})
-		}
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-			VALUES($1,$2,$3,$4,'ACKED',$5,'{}'::jsonb)`,
-			uuid.NewString(), sess.TeamID, id, sess.AgentID, now)
-		acked = append(acked, id)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to commit ack transaction", map[string]any{"error": err.Error()})
-	}
-	return map[string]any{
-		"acked":         acked,
-		"not_found":     notFound,
-		"already_acked": already,
-	}, nil
-}
-
 func (s *Service) ListAgents(ctx context.Context, p model.Principal, in ListAgentsInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, in.TeamID)
+	sess, aerr := s.requireSession(ctx, p, in.SessionID, in.TeamID)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -699,12 +472,23 @@ func (s *Service) ListAgents(ctx context.Context, p model.Principal, in ListAgen
 	if !p.HasScope("*") && !p.HasScope("list:agents") {
 		return nil, model.NewError("INVALID_INPUT", "missing list:agents scope", nil)
 	}
+	return s.AgentDirectory(ctx, p, in)
+}
 
-	args := []any{sess.TeamID}
+// AgentDirectory permits observation without registering or replacing a session.
+// A poll:self credential without list:agents sees only its own mailboxes.
+func (s *Service) AgentDirectory(ctx context.Context, p model.Principal, in ListAgentsInput) (map[string]any, *model.APIError) {
+	if p.TeamID == "" || p.Subject == "" || (!p.HasScope("list:agents") && !p.HasScope("poll:self")) {
+		return nil, model.NewError("FORBIDDEN", "agent directory permission is required", nil)
+	}
+	args := []any{p.TeamID, p.Subject}
 	query := `
-		SELECT agent_id, COALESCE(display_name,''), tags::text, capabilities::text, online, last_seen_at, COALESCE(status,'')
+		SELECT agent_id, COALESCE(display_name,''), tags::text, capabilities::text, online, last_seen_at, COALESCE(status,''), COALESCE(owner_subject=$2,false)
 		FROM agents
 		WHERE team_id=$1`
+	if !p.HasScope("list:agents") {
+		query += ` AND owner_subject=$2`
+	}
 	if !in.IncludeOffline {
 		query += ` AND online=true`
 	}
@@ -724,10 +508,10 @@ func (s *Service) ListAgents(ctx context.Context, p model.Principal, in ListAgen
 	for rows.Next() {
 		var (
 			agentID, displayName, tagsRaw, capsRaw, status string
-			online                                         bool
+			online, owned                                  bool
 			lastSeen                                       time.Time
 		)
-		if err := rows.Scan(&agentID, &displayName, &tagsRaw, &capsRaw, &online, &lastSeen, &status); err != nil {
+		if err := rows.Scan(&agentID, &displayName, &tagsRaw, &capsRaw, &online, &lastSeen, &status, &owned); err != nil {
 			return nil, model.NewError("INTERNAL_ERROR", "failed to scan agent row", map[string]any{"error": err.Error()})
 		}
 		var tags []string
@@ -742,13 +526,17 @@ func (s *Service) ListAgents(ctx context.Context, p model.Principal, in ListAgen
 			"online":       online,
 			"last_seen_at": lastSeen.Format(time.RFC3339Nano),
 			"status":       nullable(status),
+			"is_owned":     owned,
 		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, dbError("iterate agents", err)
 	}
 	return map[string]any{"agents": out}, nil
 }
 
 func (s *Service) DeregisterAgent(ctx context.Context, p model.Principal, in DeregisterInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, in.TeamID)
+	sess, aerr := s.requireSession(ctx, p, in.SessionID, in.TeamID)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -765,6 +553,12 @@ func (s *Service) DeregisterAgent(ctx context.Context, p model.Principal, in Der
 	}
 	defer tx.Rollback(ctx)
 
+	if err = lockMailboxes(ctx, tx, sess.TeamID, []string{sess.AgentID}); err != nil {
+		return nil, dbError("lock deregistration", err)
+	}
+	if aerr = authorizeSessionTx(ctx, tx, sess); aerr != nil {
+		return nil, aerr
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sessions SET active=false, invalidated_at=$1
 		WHERE session_id=$2`, now, sess.SessionID); err != nil {
@@ -796,79 +590,8 @@ func (s *Service) DeregisterAgent(ctx context.Context, p model.Principal, in Der
 	}, nil
 }
 
-func (s *Service) CancelMessage(ctx context.Context, p model.Principal, in CancelInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, "")
-	if aerr != nil {
-		return nil, aerr
-	}
-	if p.TeamID != "" && p.TeamID != sess.TeamID {
-		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
-			"expected_team": p.TeamID,
-			"session_team":  sess.TeamID,
-		})
-	}
-
-	var teamID, fromAgent string
-	err := s.db.QueryRow(ctx, `
-		SELECT team_id, from_agent_id FROM messages WHERE message_id=$1`,
-		in.MessageID).Scan(&teamID, &fromAgent)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return map[string]any{"status": "NOT_FOUND"}, nil
-	}
-	if err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to fetch message", map[string]any{"error": err.Error()})
-	}
-	if teamID != sess.TeamID || fromAgent != sess.AgentID {
-		return map[string]any{"status": "TOO_LATE"}, nil
-	}
-
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to begin cancellation transaction", map[string]any{"error": err.Error()})
-	}
-	defer tx.Rollback(ctx)
-
-	cmd, err := tx.Exec(ctx, `
-		UPDATE deliveries
-		SET state='CANCELLED'
-		WHERE message_id=$1 AND state IN ('PENDING','DELIVERED')`,
-		in.MessageID)
-	if err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to cancel deliveries", map[string]any{"error": err.Error()})
-	}
-	cancelledCount := int(cmd.RowsAffected())
-
-	var ackedCount int
-	if err := tx.QueryRow(ctx, `SELECT count(*)::int FROM deliveries WHERE message_id=$1 AND state='ACKED'`, in.MessageID).Scan(&ackedCount); err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to count acked deliveries", map[string]any{"error": err.Error()})
-	}
-	if cancelledCount > 0 {
-		_, _ = tx.Exec(ctx, `UPDATE messages SET cancelled=true WHERE message_id=$1`, in.MessageID)
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-			VALUES($1,$2,$3,NULL,'CANCELLED',$4,$5::jsonb)`,
-			uuid.NewString(), teamID, in.MessageID, time.Now().UTC(), `{"scope":"bulk"}`)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, model.NewError("INTERNAL_ERROR", "failed to commit cancellation", map[string]any{"error": err.Error()})
-	}
-
-	status := "TOO_LATE"
-	switch {
-	case cancelledCount > 0 && ackedCount == 0:
-		status = "CANCELLED"
-	case cancelledCount > 0 && ackedCount > 0:
-		status = "PARTIAL"
-	}
-	return map[string]any{
-		"status":              status,
-		"cancelled_count":     cancelledCount,
-		"already_acked_count": ackedCount,
-	}, nil
-}
-
 func (s *Service) SetAgentStatus(ctx context.Context, p model.Principal, in StatusInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, "")
+	sess, aerr := s.requireSession(ctx, p, in.SessionID, "")
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -887,19 +610,26 @@ func (s *Service) SetAgentStatus(ctx context.Context, p model.Principal, in Stat
 	default:
 		return nil, model.NewError("INVALID_INPUT", "status must be one of idle|busy|blocked", nil)
 	}
-	if _, err := s.db.Exec(ctx, `
+	cmd, err := s.db.Exec(ctx, `
 		UPDATE agents SET status=$1, status_note=$2, last_seen_at=$3, online=true
-		WHERE team_id=$4 AND agent_id=$5`,
-		status, nullable(in.Note), time.Now().UTC(), sess.TeamID, sess.AgentID); err != nil {
+		WHERE team_id=$4 AND agent_id=$5 AND owner_subject=$6 AND EXISTS(SELECT 1 FROM sessions WHERE session_id=$7 AND active)`,
+		status, nullable(in.Note), time.Now().UTC(), sess.TeamID, sess.AgentID, p.Subject, sess.SessionID)
+	if err != nil {
 		return nil, model.NewError("INTERNAL_ERROR", "failed to set status", map[string]any{"error": err.Error()})
+	}
+	if cmd.RowsAffected() == 0 {
+		return nil, model.NewError("SESSION_INVALID", "session was invalidated", nil)
 	}
 	return map[string]any{"ok": true}, nil
 }
 
 func (s *Service) GetMessageLog(ctx context.Context, p model.Principal, in LogInput) (map[string]any, *model.APIError) {
-	sess, aerr := s.requireSession(ctx, in.SessionID, "")
+	sess, aerr := s.requireSession(ctx, p, in.SessionID, "")
 	if aerr != nil {
 		return nil, aerr
+	}
+	if !p.HasScope("poll:self") {
+		return nil, model.NewError("FORBIDDEN", "mailbox read permission is required", nil)
 	}
 	if p.TeamID != "" && p.TeamID != sess.TeamID {
 		return nil, model.NewError("TEAM_MISMATCH", "token team does not match session team", map[string]any{
@@ -907,6 +637,18 @@ func (s *Service) GetMessageLog(ctx context.Context, p model.Principal, in LogIn
 			"session_team":  sess.TeamID,
 		})
 	}
+	return s.mailboxLog(ctx, p, sess.AgentID, sess.SessionID, in)
+}
+
+// PeekMailboxLog reads lifecycle metadata only, scoped to the owned mailbox.
+func (s *Service) PeekMailboxLog(ctx context.Context, p model.Principal, agent string, in LogInput) (map[string]any, *model.APIError) {
+	if err := s.AuthorizeMailbox(ctx, p, agent); err != nil {
+		return nil, err
+	}
+	return s.mailboxLog(ctx, p, agent, "", in)
+}
+
+func (s *Service) mailboxLog(ctx context.Context, p model.Principal, agent, sessionID string, in LogInput) (map[string]any, *model.APIError) {
 	limit := in.Limit
 	if limit <= 0 {
 		limit = 100
@@ -914,12 +656,12 @@ func (s *Service) GetMessageLog(ctx context.Context, p model.Principal, in LogIn
 	if limit > 1000 {
 		limit = 1000
 	}
-	args := []any{sess.TeamID}
+	args := []any{p.TeamID, agent, p.Subject, sessionID}
 	query := `
 		SELECT e.event_id, e.message_id, COALESCE(e.recipient_agent_id,''), e.event_type, e.event_at, e.details::text, COALESCE(m.in_reply_to,'')
 		FROM message_events e
 		LEFT JOIN messages m ON m.message_id=e.message_id
-		WHERE e.team_id=$1`
+		WHERE e.team_id=$1 AND (m.from_agent_id=$2 OR e.recipient_agent_id=$2 OR EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=e.message_id AND d.recipient_agent_id=$2 AND d.team_id=$1)) AND EXISTS(SELECT 1 FROM agents a WHERE a.team_id=$1 AND a.agent_id=$2 AND a.owner_subject=$3 AND ($4='' OR EXISTS(SELECT 1 FROM sessions s WHERE s.team_id=$1 AND s.agent_id=$2 AND s.session_id=$4 AND s.active)))`
 	if strings.TrimSpace(in.Since) != "" {
 		t, err := time.Parse(time.RFC3339, in.Since)
 		if err != nil {
@@ -960,6 +702,9 @@ func (s *Service) GetMessageLog(ctx context.Context, p model.Principal, in LogIn
 			"message_in_reply_to": nullable(inReplyTo),
 		})
 	}
+	if err := rows.Err(); err != nil {
+		return nil, dbError("iterate audit log", err)
+	}
 	return map[string]any{"events": out}, nil
 }
 
@@ -972,90 +717,37 @@ func (s *Service) SweepInactivity(ctx context.Context) error {
 	return err
 }
 
-func (s *Service) SweepExpiry(ctx context.Context) error {
+func (s *Service) SweepRetention(ctx context.Context) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-
-	rows, err := tx.Query(ctx, `
-		UPDATE deliveries d
-		SET state='EXPIRED'
-		FROM messages m
-		WHERE d.message_id=m.message_id
-		  AND d.state IN ('PENDING','DELIVERED')
-		  AND m.expires_at < now()
-		RETURNING d.team_id, d.message_id, d.recipient_agent_id`)
-	if err != nil {
+	var acquired bool
+	if err = tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(840174252)`).Scan(&acquired); err != nil {
 		return err
 	}
-	defer rows.Close()
-	now := time.Now().UTC()
-	for rows.Next() {
-		var teamID, messageID, recipient string
-		if err := rows.Scan(&teamID, &messageID, &recipient); err != nil {
+	if !acquired {
+		return nil
+	}
+	interval := fmt.Sprintf("%.0f seconds", s.cfg.RetentionWindow.Seconds())
+	for _, query := range []string{
+		`WITH floors AS (SELECT team_id,agent_id,max(revision) AS floor FROM mailbox_events WHERE occurred_at<now()-$1::interval GROUP BY team_id,agent_id) UPDATE agents a SET replay_floor=GREATEST(a.replay_floor,f.floor) FROM floors f WHERE a.team_id=f.team_id AND a.agent_id=f.agent_id`,
+		`DELETE FROM mailbox_events WHERE occurred_at<now()-$1::interval`,
+		`DELETE FROM message_events WHERE event_at<now()-$1::interval`,
+		`DELETE FROM deliveries WHERE message_id IN(SELECT message_id FROM messages WHERE expires_at<now()-$1::interval)`,
+		`DELETE FROM messages WHERE expires_at<now()-$1::interval`,
+		`DELETE FROM event_subscriptions WHERE expires_at<now()-$1::interval`,
+		`DELETE FROM sender_rates WHERE window_start<now()-$1::interval`,
+	} {
+		if _, err = tx.Exec(ctx, query, interval); err != nil {
 			return err
 		}
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-			VALUES($1,$2,$3,$4,'EXPIRED',$5,'{}'::jsonb)`,
-			uuid.NewString(), teamID, messageID, recipient, now)
 	}
 	return tx.Commit(ctx)
 }
 
-func (s *Service) SweepRetention(ctx context.Context) error {
-	interval := fmt.Sprintf("%.0f seconds", s.cfg.RetentionWindow.Seconds())
-	_, err := s.db.Exec(ctx, `
-		DELETE FROM deliveries
-		WHERE message_id IN (
-			SELECT message_id
-			FROM messages
-			WHERE expires_at < now() - $1::interval
-		)`, interval)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.Exec(ctx, `
-		DELETE FROM messages
-		WHERE expires_at < now() - $1::interval`, interval)
-	return err
-}
-
-func (s *Service) requireSession(ctx context.Context, sessionID, explicitTeam string) (sessionRow, *model.APIError) {
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return sessionRow{}, model.NewError("INVALID_INPUT", "session_id is required", nil)
-	}
-	var sess sessionRow
-	err := s.db.QueryRow(ctx, `
-		SELECT session_id, team_id, agent_id, principal
-		FROM sessions
-		WHERE session_id=$1 AND active=true`, sessionID).
-		Scan(&sess.SessionID, &sess.TeamID, &sess.AgentID, &sess.Principal)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return sessionRow{}, model.NewError("SESSION_INVALID", "session_id not recognized", nil)
-	}
-	if err != nil {
-		return sessionRow{}, model.NewError("INTERNAL_ERROR", "failed to load session", map[string]any{"error": err.Error()})
-	}
-	if explicitTeam != "" && explicitTeam != sess.TeamID {
-		return sessionRow{}, model.NewError("TEAM_MISMATCH", "team_id does not match session team", map[string]any{
-			"requested_team": explicitTeam,
-			"session_team":   sess.TeamID,
-		})
-	}
-
-	_, _ = s.db.Exec(ctx, `
-		UPDATE agents
-		SET last_seen_at=$1, online=true
-		WHERE team_id=$2 AND agent_id=$3`,
-		time.Now().UTC(), sess.TeamID, sess.AgentID)
-	return sess, nil
-}
-
-func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string, to map[string]any, includeSelf bool) ([]recipient, string, string, *model.APIError) {
+func (s *Service) resolveRecipients(ctx context.Context, tx pgx.Tx, teamID, senderID string, to map[string]any, includeSelf bool) ([]recipient, string, string, *model.APIError) {
 	toType := strings.TrimSpace(asString(to["type"]))
 	switch toType {
 	case "direct":
@@ -1064,7 +756,7 @@ func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string
 			return nil, "", "", model.NewError("INVALID_INPUT", "to.agent_id is required for direct messages", nil)
 		}
 		var exists bool
-		if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE team_id=$1 AND agent_id=$2)`, teamID, agentID).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agents WHERE team_id=$1 AND agent_id=$2)`, teamID, agentID).Scan(&exists); err != nil {
 			return nil, "", "", model.NewError("INTERNAL_ERROR", "failed to check direct recipient", map[string]any{"error": err.Error()})
 		}
 		if !exists {
@@ -1091,7 +783,7 @@ func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string
 		default:
 			return nil, "", "", model.NewError("INVALID_INPUT", "broadcast scope must be team or tag", nil)
 		}
-		rows, err := s.db.Query(ctx, query, args...)
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return nil, "", "", model.NewError("INTERNAL_ERROR", "failed to resolve broadcast recipients", map[string]any{"error": err.Error()})
 		}
@@ -1107,6 +799,9 @@ func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string
 			}
 			out = append(out, recipient{AgentID: agentID})
 		}
+		if err := rows.Err(); err != nil {
+			return nil, "", "", dbError("iterate recipients", err)
+		}
 		toValue := ""
 		if scope == "tag" {
 			toValue = asString(to["tag"])
@@ -1121,6 +816,18 @@ func (s *Service) resolveRecipients(ctx context.Context, teamID, senderID string
 }
 
 func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriority, max int, cursor string) ([]map[string]any, string, time.Time, *model.APIError) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, "", time.Time{}, dbError("begin poll", err)
+	}
+	defer tx.Rollback(ctx)
+	if err = lockMailboxes(ctx, tx, sess.TeamID, []string{sess.AgentID}); err != nil {
+		return nil, "", time.Time{}, dbError("lock inbox", err)
+	}
+	if aerr := authorizeSessionTx(ctx, tx, sess); aerr != nil {
+		return nil, "", time.Time{}, aerr
+	}
+
 	snapshotAt := time.Now().UTC()
 	lastPriority := 0
 	lastCreated := time.Time{}
@@ -1176,7 +883,7 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 	query += ` ORDER BY m.priority DESC, m.created_at ASC, m.message_id ASC LIMIT $` + fmt.Sprint(len(args)+1)
 	args = append(args, max+1)
 
-	rows, err := s.db.Query(ctx, query, args...)
+	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return nil, "", time.Time{}, model.NewError("INTERNAL_ERROR", "failed to poll inbox", map[string]any{"error": err.Error()})
 	}
@@ -1212,6 +919,10 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 		buf = append(buf, x)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, "", time.Time{}, dbError("iterate poll page", err)
+	}
+	rows.Close()
 	hasMore := len(buf) > max
 	if hasMore {
 		buf = buf[:max]
@@ -1239,9 +950,14 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 		ackedAt := item.AckedAt
 
 		if item.State == model.DeliveryPending {
-			state, deliveredAt, ackedAt = s.applyPendingDeliveryTransition(
-				ctx, sess, item.MessageID, item.RequireAck, ackedAt, now,
-			)
+			var apiErr *model.APIError
+			state, deliveredAt, ackedAt, apiErr = transitionOnPoll(ctx, tx, sess, item.MessageID, item.RequireAck, now)
+			if apiErr != nil {
+				return nil, "", time.Time{}, apiErr
+			}
+			if state == "" {
+				continue
+			}
 		}
 
 		attachments := []map[string]any{}
@@ -1277,125 +993,14 @@ func (s *Service) fetchPollPage(ctx context.Context, sess sessionRow, minPriorit
 			"delivered_at":   toRFC3339(deliveredAt),
 			"acked_at":       toRFC3339(ackedAt),
 			"read_receipt":   item.ReadReceipt,
+			"require_ack":    item.RequireAck,
 		})
 	}
 
+	if err = tx.Commit(ctx); err != nil {
+		return nil, "", time.Time{}, dbError("commit poll", err)
+	}
 	return out, nextCursor, snapshotAt, nil
-}
-
-func (s *Service) ensureMailboxCapacity(ctx context.Context, teamID string, recipients []recipient) *model.APIError {
-	if len(recipients) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(recipients))
-	agentIDs := make([]string, 0, len(recipients))
-	for _, r := range recipients {
-		if _, ok := seen[r.AgentID]; ok {
-			continue
-		}
-		seen[r.AgentID] = struct{}{}
-		agentIDs = append(agentIDs, r.AgentID)
-	}
-
-	rows, err := s.db.Query(ctx, `
-		SELECT recipient_agent_id, count(*)::int
-		FROM deliveries
-		WHERE team_id=$1
-		  AND recipient_agent_id = ANY($2)
-		  AND state IN ('PENDING','DELIVERED')
-		GROUP BY recipient_agent_id`,
-		teamID, agentIDs)
-	if err != nil {
-		return model.NewError("INTERNAL_ERROR", "failed to inspect mailbox depth", map[string]any{"error": err.Error()})
-	}
-	defer rows.Close()
-
-	counts := make(map[string]int, len(agentIDs))
-	for rows.Next() {
-		var agentID string
-		var pending int
-		if err := rows.Scan(&agentID, &pending); err != nil {
-			return model.NewError("INTERNAL_ERROR", "failed to inspect mailbox depth", map[string]any{"error": err.Error()})
-		}
-		counts[agentID] = pending
-	}
-
-	for _, agentID := range agentIDs {
-		if counts[agentID] >= s.cfg.MailboxCap {
-			return model.NewError("MAILBOX_FULL", "recipient mailbox at capacity", map[string]any{
-				"recipient_agent_id": agentID,
-				"mailbox_cap":        s.cfg.MailboxCap,
-			})
-		}
-	}
-
-	return nil
-}
-
-func (s *Service) applyPendingDeliveryTransition(
-	ctx context.Context,
-	sess sessionRow,
-	messageID string,
-	requireAck bool,
-	ackedAt *time.Time,
-	now time.Time,
-) (string, *time.Time, *time.Time) {
-	if requireAck {
-		deliveredAt := s.markDeliveredOnPoll(ctx, sess, messageID, now)
-		return model.DeliveryDelivered, deliveredAt, ackedAt
-	}
-	deliveredAt, autoAckedAt := s.autoAckOnPoll(ctx, sess, messageID, now)
-	return model.DeliveryAcked, deliveredAt, autoAckedAt
-}
-
-func (s *Service) markDeliveredOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) *time.Time {
-	_, _ = s.db.Exec(ctx, `
-		UPDATE deliveries
-		SET state='DELIVERED', delivered_at=COALESCE(delivered_at,$1)
-		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4`,
-		now, messageID, sess.AgentID, sess.TeamID)
-	_, _ = s.db.Exec(ctx, `
-		INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-		VALUES($1,$2,$3,$4,'DELIVERED',$5,'{}'::jsonb)`,
-		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now)
-	deliveredAt := now
-	return &deliveredAt
-}
-
-func (s *Service) autoAckOnPoll(ctx context.Context, sess sessionRow, messageID string, now time.Time) (*time.Time, *time.Time) {
-	_, _ = s.db.Exec(ctx, `
-		UPDATE deliveries
-		SET state='ACKED',
-		    delivered_at=COALESCE(delivered_at,$1),
-		    acked_at=COALESCE(acked_at,$1)
-		WHERE message_id=$2 AND recipient_agent_id=$3 AND team_id=$4`,
-		now, messageID, sess.AgentID, sess.TeamID)
-	_, _ = s.db.Exec(ctx, `
-		INSERT INTO message_events(event_id, team_id, message_id, recipient_agent_id, event_type, event_at, details)
-		VALUES($1,$2,$3,$4,'DELIVERED',$5,'{}'::jsonb),($6,$2,$3,$4,'ACKED',$5,'{}'::jsonb)`,
-		uuid.NewString(), sess.TeamID, messageID, sess.AgentID, now, uuid.NewString())
-	deliveredAt := now
-	ackedAt := now
-	return &deliveredAt, &ackedAt
-}
-
-func (s *Service) takeRateLimit(key string) bool {
-	s.rlMu.Lock()
-	defer s.rlMu.Unlock()
-
-	now := time.Now().UTC()
-	b := s.rateWindow[key]
-	if b.WindowStart.IsZero() || now.Sub(b.WindowStart) >= time.Minute {
-		s.rateWindow[key] = rateState{WindowStart: now, Count: 1}
-		return true
-	}
-	if b.Count >= s.cfg.RateLimitPerMinute {
-		return false
-	}
-	b.Count++
-	s.rateWindow[key] = b
-	return true
 }
 
 func newULID(now time.Time) string {

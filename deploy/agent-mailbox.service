@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent Mailbox Go service and viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-mailbox
+Group=agent-mailbox
+WorkingDirectory=/opt/agent-mailbox
+EnvironmentFile=/etc/agent-mailbox/mailbox.env
+ExecStart=/opt/agent-mailbox/agent-mailbox
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-mailbox
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

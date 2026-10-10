@@ -9,6 +9,7 @@ certs/
 tokens.local.json
 tokens.local.secrets.json
 tokens.dev.json
+events.key.local
 
 # Local toolchains and caches
 .tools/

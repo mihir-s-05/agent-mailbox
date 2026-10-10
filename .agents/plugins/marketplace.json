@@ -1,0 +1,20 @@
+{
+  "name": "mihir-s",
+  "interface": {
+    "displayName": "Mihir S. · Agent Mailbox"
+  },
+  "plugins": [
+    {
+      "name": "agent-mailbox",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

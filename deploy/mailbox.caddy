@@ -1,0 +1,8 @@
+# Import inside the existing site's HTTPS block after its owner chooses a route.
+# /agent-mailbox/ is an illustrative project path, not a reserved public route.
+redir /agent-mailbox /agent-mailbox/ 308
+handle_path /agent-mailbox/* {
+    reverse_proxy 127.0.0.1:8443 {
+        flush_interval -1
+    }
+}

@@ -43,11 +43,13 @@ $ctx = Get-TokenContext
 $token = $ctx.token
 $team = $ctx.team
 
-$addr = if ($env:MAILBOX_ADDR) { $env:MAILBOX_ADDR } else { ":8443" }
+$addr = if ($env:MAILBOX_ADDR) { $env:MAILBOX_ADDR } else { "127.0.0.1:8443" }
+if ($addr.StartsWith(':')) { $addr = "127.0.0.1$addr" }
 $base = if ($env:MAILBOX_BASE_PATH) { $env:MAILBOX_BASE_PATH } else { "/mcp" }
 $requireMTLS = ($env:MAILBOX_REQUIRE_MTLS -eq "true")
-$proto = if ($requireMTLS) { "https" } else { "http" }
-$url = "${proto}://127.0.0.1$addr$base"
+$useTLS = ($env:MAILBOX_TLS_ENABLED -eq "true") -or $requireMTLS
+$proto = if ($useTLS) { "https" } else { "http" }
+$url = "${proto}://$addr$base"
 
 function Invoke-Mcp([string]$method, [hashtable]$params) {
   $paramsJSON = $params | ConvertTo-Json -Depth 20 -Compress
@@ -75,16 +77,7 @@ function Invoke-Mcp([string]$method, [hashtable]$params) {
   return ($resp | ConvertFrom-Json)
 }
 
-$init = Invoke-Mcp "initialize" @{
-  protocolVersion = "2025-11-25"
-  capabilities = @{}
-  clientInfo = @{
-    name = "smoke"
-    version = "1.0.0"
-  }
-}
-
-Invoke-Mcp "notifications/initialized" @{} | Out-Null
+$discovery = Invoke-Mcp "server/discover" @{}
 
 $a = Invoke-Mcp "tools/call" @{
   name = "register_agent"
@@ -152,18 +145,3 @@ $ack = Invoke-Mcp "tools/call" @{
 
 Write-Host "MCP protocol smoke passed"
 Write-Host "Message id: $firstMessageId"
-
-if (-not $requireMTLS) {
-  claude mcp remove agent_mailbox --scope user *> $null
-  claude mcp add --transport http agent_mailbox $url --header "Authorization: Bearer $token"
-  claude mcp list
-
-  codex mcp remove agent_mailbox *> $null
-  codex mcp add agent_mailbox --url $url --bearer-token-env-var MAILBOX_TOKEN
-  $env:MAILBOX_TOKEN = $token
-  codex mcp list
-
-  Write-Host "Installed MCP server in Claude and Codex configs."
-} else {
-  Write-Host "mTLS mode enabled; skipping automatic claude/codex mcp add because client cert wiring is environment-specific."
-}

@@ -17,6 +17,7 @@ Get-Content .env | ForEach-Object {
 }
 
 $env:MAILBOX_REQUIRE_MTLS = "false"
+$env:MAILBOX_TLS_ENABLED = "false"
 
 if (-not $env:MAILBOX_TOKEN) {
   $env:MAILBOX_TOKEN = [Environment]::GetEnvironmentVariable("MAILBOX_TOKEN", "User")
@@ -35,8 +36,6 @@ if (-not $env:MAILBOX_TOKEN) {
 if (-not $env:MAILBOX_TOKEN) {
   throw "MAILBOX_TOKEN is required for stdio mode. Set it directly or run HTTP mode once to bootstrap tokens."
 }
-
-& "$repo\scripts\start-postgres.ps1" *> $null
 
 $env:PATH = "$repo\.tools\go\bin;$env:PATH"
 
