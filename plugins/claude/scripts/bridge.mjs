@@ -9,7 +9,7 @@ const args = process.argv.slice(2);
 const client = args.includes('--client=claude') ? 'claude' : 'codex';
 const channel = client === 'claude' && args.includes('--channel');
 const definitions = JSON.parse(await readFile(new URL('./tools.json', import.meta.url), 'utf8'));
-const implementation = { name: 'agent-mailbox-plugin', version: '0.1.0' };
+const implementation = { name: 'agent-mailbox-plugin', version: '0.1.1' };
 const versions = ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const capabilities = { tools: {}, ...(channel ? { experimental: { 'claude/channel': {} } } : {}) };
 const instructions = 'Call mailbox_setup to see onboarding instructions, then mailbox_connect to activate your configured agent. Identity is bound by the plugin; credentials never belong in tool arguments. Replacement of an active session needs explicit human authorization. ' + (channel ? CHANNEL_INSTRUCTIONS : 'Peeking leaves messages pending; poll_inbox records delivery and ack_messages records receipt. Report work results in a reply.');
@@ -32,9 +32,9 @@ async function handle(message) {
   if (method === 'notifications/initialized') { await plugin.reload().catch(() => {}); await plugin.startChannel(); return; }
   if (id === undefined) return;
   if (method === 'initialize') return result(id, { protocolVersion: versions.includes(params.protocolVersion) ? params.protocolVersion : '2025-11-25', capabilities, serverInfo: implementation, instructions });
-  if (method === 'server/discover') { modern = true; await plugin.reload().catch(() => {}); await result(id, { supportedVersions: versions, capabilities, instructions }); await plugin.startChannel(); return; }
+  if (method === 'server/discover') { modern = true; await plugin.reload().catch(() => {}); await result(id, { supportedVersions: versions, capabilities, instructions, ttlMs: 0, cacheScope: 'private' }); await plugin.startChannel(); return; }
   if (method === 'ping') return result(id, {});
-  if (method === 'tools/list') return result(id, { tools: plugin.tools() });
+  if (method === 'tools/list') return result(id, { tools: plugin.tools(), ...(modern ? { ttlMs: 0, cacheScope: 'private' } : {}) });
   if (method !== 'tools/call') return rpcError(id, -32601, 'Method not found');
   const lifetime = new AbortController(); running.set(id, lifetime);
   calls = calls.then(async () => {

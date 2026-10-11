@@ -9,7 +9,7 @@
       "name": "agent-mailbox",
       "source": "./plugins/claude",
       "description": "Agent messaging with opt-in Claude Channel inbox injection.",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }

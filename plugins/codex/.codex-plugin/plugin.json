@@ -1,6 +1,6 @@
 {
   "name": "agent-mailbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Durable messaging for your agents through MCP.",
   "author": {
     "name": "Mihir S.",

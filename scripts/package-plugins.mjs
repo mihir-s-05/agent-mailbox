@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const version = '0.1.0', name = 'agent-mailbox';
+const version = '0.1.1', name = 'agent-mailbox';
 const repository = 'https://github.com/mihir-s-05/agent-mailbox';
 const definitions = JSON.parse(execFileSync('go', ['run', '-buildvcs=false', './cmd/plugin-catalog'], { cwd: root, encoding: 'utf8' }));
 const json = async (file, value) => { await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, JSON.stringify(value, null, 2) + '\n'); };
