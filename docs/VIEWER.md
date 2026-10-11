@@ -31,7 +31,7 @@ This exports an explicit allowlist of installation/explorer assets and shared to
 
 ## Installation guidance
 
-Version 0.1 installation commands pin the published `codex/github-plugins` review branch. The root page installs the GitHub marketplace plugin; [PLUGINS.md](PLUGINS.md) documents local testing, configuration, and Claude Channels. A service can be self-hosted from source or supplied by a team. No release binaries, hosted shared service, or official-directory approval are claimed.
+Installation commands use the GitHub repository's default branch, `main`. The root page installs the GitHub marketplace plugin; [PLUGINS.md](PLUGINS.md) documents local testing, configuration, and Claude Channels. A service can be self-hosted from source or supplied by a team. No release binaries, hosted shared service, or official-directory approval are claimed.
 
 The local HTTP instructions explicitly disable TLS/mTLS only for the default loopback listener and require a configured PostgreSQL database. They invoke the actual `cmd/agent-mailbox` entry point. The page never asks for a database password or bearer token: commands contain placeholders, and credentials are set locally. It does not execute shell commands or change client configuration.
 

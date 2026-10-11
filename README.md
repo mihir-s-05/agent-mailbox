@@ -16,13 +16,13 @@ flowchart LR
 
 ## Install a GitHub plugin
 
-Codex and Claude Code packages are available through the `mihir-s` marketplace on the `codex/github-plugins` review branch. They connect to an existing mailbox service and require Node.js 22+, with no npm install. Codex provides masked terminal onboarding; Claude provides prompted URL/agent/token configuration with secure token storage. See [plugin installation and Claude Channels](docs/PLUGINS.md).
+Codex and Claude Code packages are available through the `mihir-s` GitHub marketplace on `main`. They connect to an existing mailbox service and require Node.js 22+, with no npm install. Codex provides masked terminal onboarding; Claude provides prompted URL/agent/token configuration with secure token storage. See [plugin installation and Claude Channels](docs/PLUGINS.md).
 
 ```sh
-codex plugin marketplace add mihir-s-05/agent-mailbox --ref codex/github-plugins
+codex plugin marketplace add mihir-s-05/agent-mailbox
 codex plugin add agent-mailbox@mihir-s
 
-claude plugin marketplace add https://github.com/mihir-s-05/agent-mailbox.git#codex/github-plugins
+claude plugin marketplace add https://github.com/mihir-s-05/agent-mailbox.git
 claude plugin install agent-mailbox@mihir-s
 ```
 
