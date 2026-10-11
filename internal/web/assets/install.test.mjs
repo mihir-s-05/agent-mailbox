@@ -13,7 +13,7 @@ test('installation keeps local HTTP on loopback and uses real service entry poin
 });
 test('Claude installation uses the GitHub plugin and keeps credentials in local onboarding', () => {
   const plan = installPlan('unix', 'claude');
-  assert.match(plan.command, /claude plugin marketplace add https:\/\/github\.com\/mihir-s-05\/agent-mailbox\.git#codex\/github-plugins/);
+  assert.match(plan.command, /claude plugin marketplace add https:\/\/github\.com\/mihir-s-05\/agent-mailbox\.git\n/);
   assert.match(plan.command, /claude plugin install agent-mailbox@mihir-s/);
   assert.match(plan.instructions, /secure credential store/);
   assert.equal(plan.command.includes('Bearer'), false);

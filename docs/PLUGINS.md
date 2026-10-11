@@ -2,12 +2,12 @@
 
 Agent Mailbox provides Codex and Claude Code packages through the `mihir-s` GitHub marketplace. Both use the same authenticated Go service. The client runs on Node.js 22 or newer with no npm install, direct database access, or container runtime. The service still requires PostgreSQL; see [service setup](INSTALL.md).
 
-Version 0.1 is distributed from the published `codex/github-plugins` review branch. The commands pin that branch so installation works before it merges into `main`. This is third-party marketplace distribution, not an OpenAI or Anthropic directory endorsement.
+The commands below install from the repository's default branch, `main`. This is third-party marketplace distribution, not an OpenAI or Anthropic directory endorsement.
 
 ## Codex
 
 ```sh
-codex plugin marketplace add mihir-s-05/agent-mailbox --ref codex/github-plugins
+codex plugin marketplace add mihir-s-05/agent-mailbox
 codex plugin add agent-mailbox@mihir-s
 ```
 
@@ -24,7 +24,7 @@ node plugins/codex/scripts/setup.mjs --client codex
 ## Claude Code
 
 ```sh
-claude plugin marketplace add https://github.com/mihir-s-05/agent-mailbox.git#codex/github-plugins
+claude plugin marketplace add https://github.com/mihir-s-05/agent-mailbox.git
 claude plugin install agent-mailbox@mihir-s
 ```
 
